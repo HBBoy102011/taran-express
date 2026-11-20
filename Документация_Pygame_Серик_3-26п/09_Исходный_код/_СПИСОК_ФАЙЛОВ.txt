@@ -1,0 +1,55 @@
+СПИСОК ФАЙЛОВ ИСХОДНОГО КОДА
+Проект: «ТАРАН-ЭКСПРЕСС» (Taran Express), версия 3.2
+Автор: Серик Жанторе Батырханулы, группа 3-26п
+Дата сборки комплекта: 19 ноября 2026
+Всего файлов: 40, из них Python: 32, строк Python: 13766
+
+Запуск из этой папки:  py game.py
+Проверки:  py test_smoke.py   |   py _meta_test.py   |   py tests/_tools/verify_content.py
+
+mobile/taran — рабочая копия пакета taran для сборки APK, поэтому в комплект не включена: настоящий код лежит в taran/. Так же пропущены каталоги mobile/build (APK 391 МБ), mobile/cdn_cache, mobile/intro_frames, mobile/sound и mobile/fonts — это двоичные материалы сборки, а не исходный код.
+
+файл                                          строк       байт
+--------------------------------------------------------------
+game.py                                        3091     145884
+progression.py                                  828      33019
+prog_ui.py                                       13        682
+test_smoke.py                                   170       6785
+_meta_test.py                                    95       3798
+README.md                                         —      13715
+ARCHITECTURE.md                                   —       7749
+pygbag.ini                                        —       1082
+tests/_tools/verify_content.py                  195       8508
+taran/__init__.py                                 2        152
+taran/assets.py                                 222       9818
+taran/audio.py                                  183       7597
+taran/config.py                                 343      22434
+taran/creatures.py                              313      14127
+taran/effects.py                                279      10993
+taran/logic.py                                  120       4959
+taran/saves.py                                   50       2202
+taran/train.py                                  181       8490
+taran/world.py                                  694      36595
+taran/ui/__init__.py                              2        116
+taran/ui/hud.py                                 919      44852
+taran/ui/shop.py                                389      18488
+taran/ui/theme.py                                27       1010
+mobile/build_apk.py                             218       9779
+mobile/dl_sdk.sh                                  —        642
+mobile/game_app.py                             3117     149964
+mobile/logo.png                                   —      57183
+mobile/main.py                                   25       1201
+mobile/make_mobile.py                           411      18058
+mobile/make_music.py                             73       2958
+mobile/make_pwa.py                              194       7762
+mobile/prepare_offline.py                       360      18752
+mobile/prog_ui.py                                13        682
+mobile/progression.py                           828      33019
+mobile/rebuild.py                                72       3308
+mobile/serve_web.py                              53       1989
+mobile/setup.py                                 286      13016
+mobile/pwa/manifest.webmanifest                   —        850
+mobile/pwa/pwa.js                                 —       6367
+mobile/pwa/sw.js                                  —       5251
+--------------------------------------------------------------
+Итого: 40 файлов, 13766 строк Python
