@@ -1,0 +1,243 @@
+// «ТАРАН-ЭКСПРЕСС» — логическая схема БД (SQLite)
+// Источник: save.json, taran/config.py, progression.py
+// Открыть: https://dbdiagram.io — File → Import → этот файл
+
+Project taran_express {
+  database_type: 'SQLite'
+  Note: 'Нормализованная модель сохранения прогресса игры. 22 таблицы.'
+}
+
+// Локации
+Table themes {
+  theme_id integer [pk]
+  name text
+  kills_required integer
+  kind text
+  light real
+}
+
+// Боссы станций
+Table bosses {
+  boss_id integer [pk]
+  theme_id integer [ref: > themes.theme_id]
+  name text
+  hp integer
+  speed real
+  time_limit real
+  flags text
+}
+
+// Улучшения магазина
+Table upgrades {
+  upgrade_key text [pk]
+  tab integer
+  req_level integer
+  name text
+  base_cost integer
+  growth real
+  max_level integer
+}
+
+// Расходники
+Table items {
+  item_key text [pk]
+  name text
+  duration_sec integer
+  price integer
+  descr text
+}
+
+// Скины прохожих
+Table skins {
+  skin_id integer [pk]
+  name text
+  palette text
+}
+
+// Сохранение игрока
+Table saves {
+  save_id integer [pk]
+  money integer
+  earned integer
+  kills integer
+  theme_id integer [ref: > themes.theme_id]
+  won boolean
+  muted boolean
+  created_at timestamp
+  updated_at timestamp
+}
+
+// Уровни улучшений
+Table save_upgrades {
+  save_id integer [ref: > saves.save_id]
+  upgrade_key text [ref: > upgrades.upgrade_key]
+  level integer
+
+  indexes {
+    (save_id, upgrade_key) [pk]
+  }
+}
+
+// Заряды расходников
+Table save_items {
+  save_id integer [ref: > saves.save_id]
+  item_key text [ref: > items.item_key]
+  count integer
+
+  indexes {
+    (save_id, item_key) [pk]
+  }
+}
+
+// Открытые скины
+Table save_skins {
+  save_id integer [ref: > saves.save_id]
+  skin_id integer [ref: > skins.skin_id]
+  unlocked_at timestamp
+
+  indexes {
+    (save_id, skin_id) [pk]
+  }
+}
+
+// Статистика
+Table save_stats {
+  save_id integer [pk, ref: - saves.save_id]
+  pushes integer
+  bosses integer
+  coins integer
+  stations integer
+  contracts_done integer
+  max_combo integer
+  best_hard_sec real
+}
+
+// Очередь уведомлений
+Table save_notices {
+  notice_id integer [pk]
+  save_id integer [ref: > saves.save_id]
+  text text
+  created_at timestamp
+}
+
+// Мета-прогрессия
+Table save_meta {
+  save_id integer [pk, ref: - saves.save_id]
+  version integer
+  reborn integer
+  bp integer
+  lifetime_earned integer
+  best_station integer
+  epoch integer
+  mod_key text [ref: > run_mods.mod_key]
+  run_bosses integer
+  runs integer
+  income_rate real
+  last_seen timestamp
+  offline_gain real
+  offline_sec real
+  play_time real
+}
+
+// Уровни депо
+Table save_meta_tree {
+  save_id integer [ref: > saves.save_id]
+  meta_key text [ref: > meta_upgrades.meta_key]
+  level integer
+
+  indexes {
+    (save_id, meta_key) [pk]
+  }
+}
+
+// Реликвии игрока
+Table save_relics {
+  save_id integer [ref: > saves.save_id]
+  relic_key text [ref: > relics.relic_key]
+  level integer
+
+  indexes {
+    (save_id, relic_key) [pk]
+  }
+}
+
+// Текущий выбор
+Table save_relic_choices {
+  save_id integer [ref: > saves.save_id]
+  relic_key text [ref: > relics.relic_key]
+  offered_at timestamp
+
+  indexes {
+    (save_id, relic_key) [pk]
+  }
+}
+
+// Контракты
+Table save_contracts {
+  contract_id integer [pk]
+  save_id integer [ref: > saves.save_id]
+  kind_key text [ref: > contract_kinds.kind_key]
+  slot integer
+  target integer
+  progress integer
+  reward_bp integer
+  done boolean
+}
+
+// Достижения
+Table save_achievements {
+  save_id integer [ref: > saves.save_id]
+  achievement_key text [ref: > achievements.achievement_key]
+  unlocked_at timestamp
+
+  indexes {
+    (save_id, achievement_key) [pk]
+  }
+}
+
+// Модификаторы рейса
+Table run_mods {
+  mod_key text [pk]
+  name text
+  descr text
+  income_mult real
+  boss_mult real
+  flow_mult real
+}
+
+// Дерево «Депо»
+Table meta_upgrades {
+  meta_key text [pk]
+  branch integer
+  name text
+  descr text
+  max_level integer
+  base_cost integer
+  growth real
+  req_level integer
+}
+
+// Реликвии
+Table relics {
+  relic_key text [pk]
+  name text
+  rarity integer
+  stat text
+  value real
+  descr text
+  max_level integer
+}
+
+// Типы контрактов
+Table contract_kinds {
+  kind_key text [pk]
+  name text
+  stat text
+}
+
+// Достижения (справочник)
+Table achievements {
+  achievement_key text [pk]
+  name text
+  descr text
+}
