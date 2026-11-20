@@ -187,7 +187,27 @@ def main():
     check(copied_lines == D.REAL_TOTAL,
           "строк в 17 модулях совпадает с документами: %d" % copied_lines)
 
-    print("\n7. Итоги")
+    print("\n7. Ссылки на исходный код в документах 14 и 19")
+    for folder, fname in ((D.F05, "14_Документация_кода.docx"),
+                          (D.F07, "19_Руководство_разработчика.docx")):
+        path = os.path.join(folder, fname)
+        if not os.path.exists(path):
+            check(False, "%s отсутствует" % fname)
+            continue
+        doc = Document(path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    text += "\n" + cell.text
+        check("09_Исходный_код" in text, "%s: есть ссылка на 09_Исходный_код" % fname)
+        rows = text.count("09_Исходный_код/")
+        check(rows >= len(D.MODULE_FILES),
+              "%s: строк таблицы «модуль → файл»: %d" % (fname, rows))
+        check(all(p in text for p in ("taran/ui/hud.py", "game.py", "progression.py")),
+              "%s: в таблице есть ключевые модули" % fname)
+
+    print("\n8. Итоги")
     print(f"  DOCX: {docx_count}, XLSX: {xlsx_count}, "
           f"PNG: {len(D.DIAGRAMS) + len(D.SCREENSHOTS) * 2 + 1}, "
           f"drawio: {len(D.DIAGRAMS)}")

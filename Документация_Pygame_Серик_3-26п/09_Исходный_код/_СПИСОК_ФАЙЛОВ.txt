@@ -16,7 +16,7 @@ progression.py                                  828      33019
 prog_ui.py                                       13        682
 test_smoke.py                                   170       6785
 _meta_test.py                                    95       3798
-README.md                                         —      13715
+README.md                                         —      10967
 ARCHITECTURE.md                                   —       7749
 pygbag.ini                                        —       1082
 tests/_tools/verify_content.py                  195       8508

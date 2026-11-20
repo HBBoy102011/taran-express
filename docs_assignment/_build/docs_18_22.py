@@ -5,7 +5,7 @@ import os
 from assign_docx import Doc
 from assign_data import (AUTHOR, BOSSES, BUGS, CHECKS, CHECKS_TOTAL, DATE,
                          F07, F08, GROUP, MANIFEST, MODULES, PERF, REAL_TOTAL,
-                         SCREENSHOTS, TEST_CASES, THEMES, shot)
+                         SCREENSHOTS, TEST_CASES, THEMES, shot, src_rows)
 
 
 def _fig(d, name, caption, width=16.2):
@@ -206,6 +206,25 @@ def build_dev_guide():
     ])
     d.p("Полная карта модулей и план рефакторинга — в `ARCHITECTURE.md` и документе "
         "12 «Архитектура программы».")
+
+    d.h1("3.1. Где лежит исходный код: модуль, файл, строки")
+    d.p("Копия проекта для сверки — папка `09_Исходный_код` рядом с документами. "
+        "Из неё запускаются те же команды, что и в рабочем каталоге: `py game.py`, "
+        "`py test_smoke.py`, `py _meta_test.py`, `py tests/_tools/verify_content.py`. "
+        "Таблица связывает разделы этого руководства с файлами: итог по 17 "
+        f"модулям — {REAL_TOTAL} строк, как и в документе 14.")
+    d.table(["Модуль", "Файл в комплекте", "Строк"], src_rows(),
+            widths=[6.6, 7.4, 1.8], size=8.6,
+            caption="Модуль → файл → строки (папка 09_Исходный_код)",
+            align_center=[2])
+    d.bullets([
+        "Проверки: `09_Исходный_код/test_smoke.py` (19), "
+        "`_meta_test.py` (12), `tests/_tools/verify_content.py` (33).",
+        "Мобильная сборка: `09_Исходный_код/mobile/` — 16 файлов, APK и PWA.",
+        "Перечень всех файлов с размерами — `09_Исходный_код/_СПИСОК_ФАЙЛОВ.txt`.",
+        "Папка пересобирается вместе с комплектом: `py "
+        "docs_assignment/_build/build_all.py --zip`.",
+    ])
 
     d.h1("4. Как добавить станцию")
     d.steps([
