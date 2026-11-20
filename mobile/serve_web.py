@@ -23,6 +23,7 @@ MIME = {
     ".data": "application/octet-stream",
     ".apk": "application/octet-stream",
     ".json": "application/json",
+    ".webmanifest": "application/manifest+json",
     ".png": "image/png",
     ".ogg": "audio/ogg",
     ".ttf": "font/ttf",

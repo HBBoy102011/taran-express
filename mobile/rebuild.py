@@ -8,7 +8,8 @@
   2. патч десктопного game.py под веб (mobile/make_mobile.py);
   3. сборка pygbag: архив игры + index.html -> mobile/build/web;
   4. перевод страницы на локальный рантайм (mobile/prepare_offline.py);
-  5. сборка и подпись APK (mobile/build_apk.py).
+  5. PWA-слой для установки с сайта (mobile/make_pwa.py);
+  6. сборка и подпись APK (mobile/build_apk.py).
 
 Ничего не качает, если один раз прогнал py mobile/setup.py --fetch.
 """
@@ -24,7 +25,7 @@ for _s in (sys.stdout, sys.stderr):
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 VENV_PY = os.path.join(ROOT, ".apkbuild", "Scripts", "python.exe")
-OUT_APK = os.path.join(HERE, "build", "train_game_v4.0.apk")
+OUT_APK = os.path.join(HERE, "build", "TaranExpress_v3.2.apk")
 CDN_CACHE = os.path.join(HERE, "cdn_cache")
 
 
@@ -40,10 +41,15 @@ def main():
     if not os.path.exists(VENV_PY):
         sys.exit("нет .apkbuild — сначала  py mobile/setup.py --fetch")
 
-    step("1/5 комплект", [sys.executable, os.path.join(HERE, "setup.py")])
-    step("2/5 патч игры под веб", [sys.executable, os.path.join(HERE, "make_mobile.py")])
-    step("3/5 pygbag build", [VENV_PY, "-m", "pygbag", "--build", os.path.join("mobile")])
-    step("4/5 локальный рантайм", [sys.executable, os.path.join(HERE, "prepare_offline.py")])
+    step("1/6 комплект", [sys.executable, os.path.join(HERE, "setup.py")])
+    step("2/6 патч игры под веб", [sys.executable, os.path.join(HERE, "make_mobile.py")])
+    # --disable-sound-format-error: звук у нас в WAV (синтезируется make_sounds.py),
+    # а pygbag по умолчанию требует OGG. WAV в WASM-сборке проигрывается: SDL_mixer
+    # читает его встроенным декодером, поэтому конвертация в OGG не нужна.
+    step("3/6 pygbag build", [VENV_PY, "-m", "pygbag", "--build",
+                              "--disable-sound-format-error", os.path.join("mobile")])
+    step("4/6 локальный рантайм", [sys.executable, os.path.join(HERE, "prepare_offline.py")])
+    step("5/6 PWA-слой", [sys.executable, os.path.join(HERE, "make_pwa.py")])
 
     # обновляем кэш рантайма: если pygbag что-то своё положил рядом — сохраним
     web_cdn = os.path.join(HERE, "build", "web", "cdn")
@@ -56,7 +62,7 @@ def main():
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy(src, dst)
 
-    step("5/5 APK", [sys.executable, os.path.join(HERE, "build_apk.py")])
+    step("6/6 APK", [sys.executable, os.path.join(HERE, "build_apk.py")])
 
     if os.path.exists(OUT_APK):
         print(f"\nГОТОВО: {OUT_APK}  ({os.path.getsize(OUT_APK) / 1024 / 1024:.1f} МБ)")

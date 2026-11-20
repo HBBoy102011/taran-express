@@ -4,7 +4,7 @@
 Три архива скачиваются заранее (см. mobile/dl_sdk.sh) и распаковываются в
 android_sdk/: JDK 17, build-tools (aapt2, d8, apksigner, zipalign) и android.jar.
 
-    py mobile/build_apk.py          ->  mobile/build/train_game_v4.0.apk
+    py mobile/build_apk.py          ->  mobile/build/TaranExpress_v3.2.apk
 
 АПК подписывается debug-ключом (self-signed) — для себя и друзей этого хватает,
 для Google Play нужен свой выпускной ключ.
@@ -24,7 +24,7 @@ ROOT = os.path.dirname(HERE)
 SDK = os.path.join(ROOT, "android_sdk")
 WEB = os.path.join(HERE, "build", "web")
 WORK = os.path.join(HERE, "build", "apk_work")
-OUT_APK = os.path.join(HERE, "build", "train_game_v4.0.apk")
+OUT_APK = os.path.join(HERE, "build", "TaranExpress_v3.2.apk")
 PKG = "com.ice.trainclicker"
 
 
@@ -100,7 +100,7 @@ def main():
     print("копирую веб-сборку в assets (~23 МБ)...")
     assets = os.path.join(WORK, "assets", "web")
     shutil.copytree(WEB, assets,
-                    ignore=shutil.ignore_patterns("*.log", "*.tar.gz", "mobile.apk"))
+                    ignore=shutil.ignore_patterns("*.log", "*.tar.gz"))
 
     # ---------- 3. манифест и ресурсы ----------
     manifest = os.path.join(ROOT, "apk", "AndroidManifest.xml")
@@ -113,6 +113,11 @@ def main():
         d = os.path.join(res_dir, "drawable")
         os.makedirs(d, exist_ok=True)
         shutil.copy(icon_src, os.path.join(d, "ic_launcher.png"))
+    icon_round = os.path.join(ROOT, "apk", "icon_round.png")
+    if os.path.exists(icon_round):
+        d = os.path.join(res_dir, "drawable")
+        os.makedirs(d, exist_ok=True)
+        shutil.copy(icon_round, os.path.join(d, "ic_launcher_round.png"))
 
     res_zip = os.path.join(WORK, "res.zip")
     if os.path.exists(os.path.join(res_dir, "drawable")):
@@ -158,7 +163,7 @@ def main():
                 # путь в архиве = assets/web/... — так его ищет getAssets().open("web/...")
                 arc = "assets/" + os.path.relpath(full, os.path.dirname(assets)).replace(os.sep, "/")
                 # сжатие мешает отдавать файл потоком — бинарники кладём без сжатия
-                mode = zipfile.ZIP_STORED if fn.endswith((".wasm", ".data", ".js", ".whl", ".ogg")) else zipfile.ZIP_DEFLATED
+                mode = zipfile.ZIP_STORED if fn.endswith((".wasm", ".data", ".js", ".whl", ".ogg", ".apk")) else zipfile.ZIP_DEFLATED
                 if mode == zipfile.ZIP_STORED:
                     with open(full, "rb") as fh:
                         z.writestr(zipfile.ZipInfo(arc), fh.read(), zipfile.ZIP_STORED)
@@ -184,12 +189,26 @@ def main():
             "assets/web/cdn/0.9.3/cpython312/main.wasm",
             "assets/web/cdn/0.9.3/cpython312/main.data",
             "assets/web/cdn/index-0.9.3-cp312.json",
-            "assets/web/cdn/cp312/pygame_ce-2.5.7-cp312-cp312-wasm32_bi_emscripten.whl"]
+            "assets/web/cdn/cp312/pygame_ce-2.5.7-cp312-cp312-wasm32_bi_emscripten.whl",
+            "assets/web/mobile.apk", "assets/web/logo.png",
+            "res/drawable/ic_launcher.png", "res/drawable/ic_launcher_round.png"]
     with zipfile.ZipFile(OUT_APK) as z:
         names = z.namelist()
     miss = [k for k in need if k not in names]
     if miss:
         die("в APK не попало: " + ", ".join(miss))
+
+    # звук лежит внутри архива игры mobile.apk — проверяем, что он там есть
+    try:
+        with zipfile.ZipFile(os.path.join(WEB, "mobile.apk")) as gz:
+            inner = gz.namelist()
+        for _snd in ("sound/coin.wav", "sound/hit.wav", "sound/train.wav",
+                     "sound/music/intro.ogg", "sound/music/station_1.ogg",
+                     "sound/music/boss.ogg"):
+            if not any(n.endswith(_snd) for n in inner):
+                die("в mobile.apk нет звука: " + _snd)
+    except zipfile.BadZipFile:
+        die("mobile.apk повреждён")
 
     size = os.path.getsize(OUT_APK) / 1024 / 1024
     print(f"\nГОТОВО: {OUT_APK}  ({size:.1f} МБ)")

@@ -193,15 +193,36 @@ def check_fonts(fetch_missing):
             shutil.copy(src, dst)
 
 
+def _has_sdk_content(folder):
+    """Папка после распаковки SDK-архива считается рабочей, если внутри нашлось
+    что-то нужное сборке (иначе архив мог быть распакован не полностью)."""
+    if not os.path.isdir(folder):
+        return False
+    probes = {"jdk": ("javac.exe",), "build-tools": ("aapt2.exe", "apksigner.bat", "d8.bat"),
+              "platform": ("android.jar",)}
+    for dirpath, dirnames, filenames in os.walk(folder):
+        if any(n in filenames for n in probes.get(os.path.basename(folder), ())):
+            return True
+    return False
+
+
 def check_sdk(fetch_missing):
+    """Проверка инструментов Android. Достаточно распакованной папки (jdk/, build-tools/,
+    platform/): сами архивы (~300 МБ) качаются только если папок нет — держать их
+    рядом больше не обязательно."""
+    folder_of = {"jdk.zip": "jdk", "bt.zip": "build-tools", "platform.zip": "platform"}
     for name, url in SDK_FILES.items():
         p = os.path.join(SDK, name)
-        if os.path.exists(p) and os.path.getsize(p) > 1 << 20:
+        folder = os.path.join(SDK, folder_of.get(name, name[:-4]))
+        if _has_sdk_content(folder):
+            ok(f"android_sdk/{os.path.basename(folder)}/ (распаковано, {name} не нужен)")
+        elif os.path.exists(p) and os.path.getsize(p) > 1 << 20:
             ok(f"android_sdk/{name} ({os.path.getsize(p) / 1024 / 1024:.0f} МБ)")
         elif fetch_missing:
             fetch(url, p, name)
         else:
-            bad(f"нет android_sdk/{name}", "py mobile/setup.py --fetch")
+            bad(f"нет android_sdk/{name} и папки {folder_of.get(name, name[:-4])}",
+                "py mobile/setup.py --fetch")
     if not os.path.isdir(SDK):
         os.makedirs(SDK, exist_ok=True)
     if fetch_missing:

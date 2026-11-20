@@ -1,5 +1,4 @@
 import colorsys
-import json
 import math
 import os
 import random
@@ -7,15 +6,71 @@ import sys
 
 import pygame
 
-# ---------- размеры ----------
-# Игра считает всё в логических координатах 1280x720, а рисует в K раз подробнее
-# (на экране 1920x1080 K = 1.5, на 2560x1440 и выше K = 2). Так картинка чёткая,
-# а механика, координаты и баланс не зависят от разрешения.
-W, H = 1280, 720
-GW, PW = 960, 320            # игровая зона и панель магазина
-PLAT_TOP, PLAT_BOT = 400, 470
-TRAIN_Y = 488                # верх корпуса поезда
-TRACK_Y = 596                # высота ног на путях
+import progression as P
+import prog_ui as UI
+P.bind(sys.modules[__name__])
+
+# статические данные и геометрия живут в отдельном модуле;
+# звёздочный импорт сохраняет прежние имена game.W, game.THEMES и т.д.
+from taran.config import *  # noqa: E402,F401,F403
+from taran.ui.theme import *  # noqa: E402,F401,F403
+from taran.audio import SoundKit  # noqa: E402
+import taran.assets as ASSETS  # noqa: E402
+from taran.assets import (  # noqa: E402,F401
+    build_panel_bg, make_acid_overlay, make_cone, make_shadow, make_skull,
+    make_vignette,
+)
+
+ASSETS.bind(sys.modules[__name__])
+
+import taran.creatures as CREATURES  # noqa: E402
+from taran.creatures import creature_surf  # noqa: E402,F401
+
+CREATURES.bind(sys.modules[__name__])
+
+import taran.train as TRAIN  # noqa: E402
+from taran.train import Train, TRAIN_CACHE, train_sprite  # noqa: E402,F401
+
+TRAIN.bind(sys.modules[__name__])
+
+import taran.effects as EFFECTS  # noqa: E402
+from taran.effects import (  # noqa: E402,F401
+    Acid, Coin, Decal, Effect, Particle, SkullFly, TapFX,
+)
+
+EFFECTS.bind(sys.modules[__name__])
+
+import taran.world as WORLD  # noqa: E402
+from taran.world import World  # noqa: E402
+
+WORLD.bind(sys.modules[__name__])
+
+
+from taran.logic import (  # noqa: F401  (реэкспорт старых имён game.*)
+    boss_at, boss_dmg_scale, cost, inflation, item_buy_rect, item_price,
+    new_save, pick_kind, pick_skin, skull_chance, stage_for, tab_items, up_infl,
+)
+import taran.saves as SAVES  # noqa: E402
+from taran.ui.hud import (  # noqa: E402,F401  (реэкспорт для старых вызовов)
+    _HEART, draw_boss_bar, draw_heart, draw_mute_button, mute_hit,
+)
+
+import taran.ui.shop as SHOP
+from taran.ui.shop import (  # noqa: F401  (реэкспорт для тестов и старого кода)
+    draw_panel, card, ui_pill, ui_badge, ui_bar, ui_key,
+    _PANEL_FRAME, _PULSE, ITEM_COLS, TAB_COLORS,
+)
+SHOP.bind(sys.modules[__name__])
+
+
+# В браузере (pygbag/WASM) отрисовка заметно дороже, чем на десктопе:
+# этот флаг включает экономные варианты погоды и эффектов.
+WEB = sys.platform == "emscripten"
+WEB_K = 0.75                 # внутреннее разрешение веб-версии (960×540)
+
+# табличка станции (World.station): реплики прохожих не должны её перекрывать
+SIGN_RECT = pygame.Rect(180, 236, 252, 52)
+QUOTE_BOXES = []             # облачка, уже нарисованные в текущем кадре
 # в замороженном exe __file__ ведёт во временный распакованный каталог,
 # поэтому сохраняем рядом с самим exe — иначе прогресс пропадал бы при выходе
 if getattr(sys, "frozen", False):
@@ -27,9 +82,59 @@ SAVE = os.path.join(_BASE_DIR, "save.json")
 # линейная фильтрация при растяжении картинки на весь экран: без неё SDL "рубит" пиксели
 os.environ.setdefault("SDL_RENDER_SCALE_QUALITY", "linear")
 os.environ.setdefault("SDL_HINT_RENDER_SCALE_QUALITY", "linear")
+# маленький буфер — звук без заметной задержки; 22050 Гц хватает для чиптюна
+try:
+    # в браузере буфер больше: музыка не захлёбывается, когда кадр подвис
+    pygame.mixer.pre_init(22050, -16, 2, 1024 if WEB else 512)
+except Exception:
+    pass
 pygame.init()
-pygame.display.set_caption("Платформа-кликер HD")
+pygame.display.set_caption("ТАРАН-ЭКСПРЕСС")
 fullscreen = True
+
+
+# ---------- звук и музыка (см. taran/audio.py) ----------
+SND = SoundKit(_BASE_DIR)
+
+
+def web_boot_done():
+    """Сообщает странице загрузки, что игра сейчас покажет первый кадр."""
+    try:
+        import platform
+        platform.window.__gameBootDone()
+    except Exception:
+        pass
+
+
+_BACKDROP = {"key": None}
+
+
+def sync_backdrop(theme):
+    """Заливает чёрные поля по бокам продолжением сцены.
+
+    Кадр игры — 16:9, а экран телефона шире (примерно 20:9). Раньше по краям
+    оставались чёрные полосы; теперь фон страницы собирается из цветов текущей
+    локации (небо, платформа, насыпь), и картинка выглядит цельной.
+    Меняется только при переходе на другую станцию.
+    """
+    if not WEB:
+        return
+    key = theme.get("name")
+    if _BACKDROP["key"] == key:
+        return
+    _BACKDROP["key"] = key
+    try:
+        import platform
+        css = ("linear-gradient(180deg, rgb{} 0%, rgb{} 54%, rgb{} 56%, "
+               "rgb{} 65%, rgb{} 66%, rgb{} 84%, rgb{} 100%)").format(
+            tuple(theme["top"]), tuple(theme["bot"]), tuple(theme["plat"]),
+            tuple(theme["plat"]), tuple(theme["front"]), tuple(theme["bed"]),
+            tuple(theme["bed"]))
+        doc = platform.window.document
+        doc.documentElement.style.background = css
+        doc.body.style.background = css
+    except Exception:
+        pass
 
 # ---------- разрешение рендера ----------
 K = 1.0                      # масштаб рендера относительно логических координат
@@ -88,16 +193,22 @@ def desktop_size():
     return W, H
 
 
-def snap(k):
-    return max(1.0, min(2.0, int(k * 4) / 4.0))     # шаг 0.25, от 1 до 2
+def snap(k, lo=1.0):
+    return max(lo, min(2.0, int(k * 4) / 4.0))     # шаг 0.25
 
 
 def scale_fullscreen():
+    if WEB:
+        # WASM на телефоне не тянет 1280×720 каждый кадр. 0.75 — это 960×540:
+        # на экране телефона разницы почти не видно, а рисуется на 44% меньше.
+        return WEB_K
     dw, dh = desktop_size()
     return snap(min(dw / W, dh / H))
 
 
 def scale_windowed():
+    if WEB:
+        return WEB_K
     dw, dh = desktop_size()
     return snap(min(dw * 0.92 / W, dh * 0.86 / H))
 
@@ -233,6 +344,31 @@ def fast(s, alpha=True):
         return s
 
 
+_PRESENT = {"size": None, "surf": None}
+
+
+def present(canvas_buf, win, ox, oy, dw, dh):
+    """Вывод кадра в окно без лишних аллокаций.
+
+    При совпадении размеров — прямой blit. Иначе smoothscale пишет в одну
+    переиспользуемую поверхность: раньше каждый кадр создавалась новая, и
+    сборщик мусора тратил на это заметную часть времени.
+    """
+    if (dw, dh) == canvas_buf.get_size():
+        win.blit(canvas_buf, (ox, oy))
+        return
+    st = _PRESENT
+    if st["surf"] is None or st["size"] != (dw, dh):
+        st["surf"] = pygame.Surface((dw, dh))
+        try:
+            st["surf"] = st["surf"].convert()
+        except pygame.error:
+            pass
+        st["size"] = (dw, dh)
+    pygame.transform.smoothscale(canvas_buf, (dw, dh), st["surf"])
+    win.blit(st["surf"], (ox, oy))
+
+
 def blit(dst, src, pos):
     dst.blit(src, (px(pos[0]), px(pos[1])))
 
@@ -286,8 +422,23 @@ _GC = {}
 _PC = {}
 _GB = [0]                              # объём кэша свечений в байтах
 SPR = {}                               # кэш спрайтов людей и боссов
-TRAIN_CACHE = {}
 _OFFS = ((0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (1, 2), (2, 2), (1, 3), (2, 3))
+
+
+def spr_trim():
+    """Держит кэш спрайтов в разумных рамках.
+
+    Раньше при переполнении разом удалялось 150 картинок — на следующем кадре
+    они строились заново, из-за чего были заметны рывки. Теперь лимит выше
+    (на WEB рендер мельче, значит картинки дешевле), а чистим понемногу.
+    """
+    limit = 1000 if K <= 1.0 else (760 if K <= 1.5 else 560)
+    if len(SPR) <= limit:
+        return
+    for _ in range(80):
+        if not SPR:
+            break
+        SPR.pop(next(iter(SPR)))
 
 
 def _text_img(s, f, color, shadow):
@@ -326,9 +477,48 @@ def text(surf, s, f, color, pos, center=False, shadow=True):
     return bw / K
 
 
+_TWC = {}                      # ширина строки по (шрифт, текст) — size() дорогой
+
+
 def twidth(f, s):
-    """Ширина строки в логических пикселях."""
-    return f.size(s)[0] / K
+    """Ширина строки в логических пикселях (с кэшем: size() зовётся один раз).
+
+    twidth вызывается каждый кадр для облачков, HUD и подписей в панели,
+    а Font.size — одна из самых дорогих операций pygame: без кэша на 10 людях
+    с репликами уходило ~1,2 мс кадра.
+    """
+    key = (f, s)
+    w = _TWC.get(key)
+    if w is None:
+        w = f.size(s)[0] / K
+        if len(_TWC) > 3000:
+            _TWC.clear()
+        _TWC[key] = w
+    return w
+
+
+def ellipsize(f, s, maxw):
+    """Обрезает строку по ширине и ставит «…», чтобы она не заезжала под кнопку."""
+    if maxw <= 0:
+        return ""
+    if twidth(f, s) <= maxw:
+        return s
+    while s and twidth(f, s + "…") > maxw:
+        s = s[:-1]
+    return s.rstrip() + "…"
+
+
+def fit_font(s, maxw, fonts=None):
+    """Самый крупный шрифт из списка, при котором строка влезает в maxw.
+
+    На телефоне экран узкий, и длинные сообщения («Прогресс сброшен —
+    начинаем заново!») уезжали за край: вместо обрезки уменьшаем кегль.
+    """
+    cands = fonts or (f_big, f_money, f_mid, f_small)
+    for f in cands:
+        if f is not None and twidth(f, s) <= maxw:
+            return f
+    return cands[-1]
 
 
 def _make_glow(r, color, alpha):
@@ -383,60 +573,6 @@ def plate(surf, rect, alpha=150, radius=12, color=(10, 12, 24), border=(255, 255
     surf.blit(s, (px(rect.x), px(rect.y)))
 
 
-def draw_heart(surf, x, y, r, filled):
-    """Сердечко-жизнь в хардкоре: пустое — уже потрачено."""
-    col = (245, 74, 86) if filled else (60, 46, 56)
-    D.circle(surf, col, (x - r * 0.5, y - r * 0.3), r * 0.62)
-    D.circle(surf, col, (x + r * 0.5, y - r * 0.3), r * 0.62)
-    D.polygon(surf, col, [(x - r * 1.05, y), (x + r * 1.05, y), (x, y + r * 1.3)])
-    if filled:
-        D.circle(surf, (255, 176, 180), (x - r * 0.55, y - r * 0.55), max(1, r * 0.2))
-
-
-def make_vignette():
-    """Карта затемнения по краям; накладывается через BLEND_RGB_MULT (быстрее alpha-blit)."""
-    sw, sh = 64, 40
-    s = pygame.Surface((sw, sh))
-    for y in range(sh):
-        for x in range(sw):
-            dx = (x / (sw - 1) - 0.5) * 2
-            dy = (y / (sh - 1) - 0.5) * 2
-            d = math.sqrt(dx * dx * 0.8 + dy * dy)
-            a = max(0.0, min(1.0, (d - 0.62) / 0.75)) ** 1.6 * 150 / 255.0
-            v = int(255 * (1 - a))
-            s.set_at((x, y), (v, v, min(255, v + 4)))
-    return fast(pygame.transform.smoothscale(s, (GWP, HP)), False)
-
-
-def make_cone(w, h, vertical, peak):
-    """Конус света: вертикальный (фонарь) или горизонтальный (прожектор поезда)."""
-    pw, ph = px(w), px(h)
-    s = pygame.Surface((pw, ph), pygame.SRCALPHA)
-    if vertical:
-        for y in range(ph):
-            k = y / ph
-            half = int((8 + (w / 2 - 8) * k) * K)
-            a = int(peak * (1 - k) ** 1.3)
-            pygame.draw.line(s, (255, 240, 170, a), (pw // 2 - half, y), (pw // 2 + half, y))
-    else:
-        for x in range(pw):
-            k = (pw - 1 - x) / pw
-            half = int((6 + (h / 2 - 6) * k) * K)
-            a = int(peak * (1 - k) ** 1.2)
-            pygame.draw.line(s, (255, 244, 190, a), (x, ph // 2 - half), (x, ph // 2 + half))
-    return fast(s)
-
-
-def make_shadow(big):
-    if big:
-        s = new_surf(90, 22)
-        D.ellipse(s, (0, 0, 0, 50), (0, 0, 90, 22))
-        D.ellipse(s, (0, 0, 0, 70), (12, 4, 66, 14))
-    else:
-        s = new_surf(46, 14)
-        D.ellipse(s, (0, 0, 0, 40), (0, 0, 46, 14))
-        D.ellipse(s, (0, 0, 0, 60), (6, 2, 34, 10))
-    return fast(s)
 
 
 _DIRS8 = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1))
@@ -455,178 +591,12 @@ def outlined(fig, col=(14, 14, 24), o=None):
     return out
 
 
-# ---------- локации (10 уровней, меняются по числу поездок) ----------
-THEMES = [
-    dict(name="Утро", kills=0, kind="day", light=0.0,
-         top=(110, 185, 245), bot=(220, 240, 252), far=(160, 192, 215), near=(120, 150, 175),
-         plat=(158, 158, 168), front=(112, 112, 128), bed=(92, 82, 74), rail=(195, 195, 205),
-         train=(205, 50, 50), cloud=(255, 255, 255)),
-    dict(name="Закат", kills=20, kind="sunset", light=0.3,
-         top=(70, 60, 135), bot=(255, 155, 95), far=(130, 85, 115), near=(80, 52, 88),
-         plat=(145, 128, 138), front=(100, 84, 100), bed=(82, 66, 66), rail=(210, 180, 170),
-         train=(225, 95, 50), cloud=(255, 190, 170)),
-    dict(name="Ночь", kills=60, kind="night", light=1.0,
-         top=(8, 12, 38), bot=(42, 52, 105), far=(30, 38, 74), near=(18, 22, 50),
-         plat=(72, 78, 98), front=(50, 54, 74), bed=(40, 38, 50), rail=(135, 140, 165),
-         train=(60, 110, 205), cloud=(48, 58, 100)),
-    dict(name="Зима", kills=120, kind="snow", light=0.2,
-         top=(150, 182, 218), bot=(236, 243, 251), far=(192, 207, 224), near=(160, 178, 202),
-         plat=(228, 234, 242), front=(172, 182, 198), bed=(192, 197, 208), rail=(150, 156, 172),
-         train=(70, 150, 172), cloud=(246, 249, 253)),
-    dict(name="Ливень", kills=220, kind="rain", light=0.6,
-         top=(46, 54, 68), bot=(104, 114, 126), far=(76, 86, 100), near=(54, 62, 76),
-         plat=(96, 100, 108), front=(70, 73, 82), bed=(56, 53, 52), rail=(150, 156, 168),
-         train=(172, 62, 62), cloud=(62, 68, 80)),
-    dict(name="Неон-сити", kills=400, kind="neon", light=1.0,
-         top=(24, 4, 62), bot=(215, 42, 152), far=(72, 20, 112), near=(40, 10, 76),
-         plat=(56, 46, 88), front=(36, 28, 62), bed=(30, 22, 50), rail=(0, 232, 232),
-         train=(0, 205, 232), cloud=(120, 52, 160)),
-    dict(name="Пустыня", kills=650, kind="desert", light=0.0,
-         top=(240, 170, 80), bot=(255, 232, 175), far=(222, 172, 112), near=(190, 140, 90),
-         plat=(214, 186, 140), front=(170, 140, 100), bed=(150, 120, 85), rail=(210, 200, 185),
-         train=(40, 150, 120), cloud=(255, 240, 215)),
-    dict(name="Вулкан", kills=950, kind="lava", light=0.8,
-         top=(40, 10, 10), bot=(200, 60, 20), far=(90, 30, 25), near=(55, 18, 18),
-         plat=(80, 62, 62), front=(56, 42, 44), bed=(44, 32, 32), rail=(255, 140, 60),
-         train=(230, 110, 30), cloud=(90, 35, 30)),
-    dict(name="Космос", kills=1350, kind="space", light=1.0,
-         top=(3, 3, 18), bot=(40, 20, 90), far=(35, 30, 80), near=(22, 18, 60),
-         plat=(90, 96, 130), front=(60, 64, 96), bed=(34, 32, 60), rail=(150, 200, 255),
-         train=(180, 185, 215), cloud=(50, 40, 110)),
-    dict(name="Последняя станция", kills=1900, kind="finale", light=1.0,
-         top=(15, 0, 20), bot=(120, 30, 90), far=(50, 15, 60), near=(28, 8, 38),
-         plat=(60, 50, 70), front=(40, 30, 52), bed=(28, 20, 36), rail=(255, 255, 255),
-         train=(20, 20, 26), cloud=(90, 40, 100)),
-]
-KEYS = ("top", "bot", "far", "near", "plat", "front", "bed", "rail", "train", "cloud")
-STAR_KINDS = ("night", "neon", "space", "finale")
 
 
 def blend(t0, t1, t):
     d = {k: lerp_c(t0[k], t1[k], t) for k in KEYS}
     d["light"] = lerp(t0["light"], t1["light"], t)
     return d
-
-
-def stage_for(kills):
-    idx = 0
-    for i, th in enumerate(THEMES):
-        if kills >= th["kills"]:
-            idx = i
-    return idx
-
-
-# ---------- боссы: по одному на каждый уровень ----------
-BOSSES = [
-    dict(name="Начальник станции", hp=40, speed=70, time=45, flags=(),
-         color=(200, 40, 40), skin=(245, 210, 170), hair=(40, 30, 25), hat=(30, 30, 40)),
-    dict(name="Бегун-спринтер", hp=70, speed=170, time=45, flags=("erratic",),
-         color=(60, 200, 90), skin=(225, 180, 135), hair=(30, 30, 30), hat=(255, 80, 80)),
-    dict(name="Тень", hp=100, speed=90, time=50, flags=("ghost", "acid"),
-         color=(40, 40, 60), skin=(70, 70, 95), hair=(15, 15, 25), hat=None),
-    dict(name="Снеговик-гигант", hp=140, speed=60, time=50, flags=("regen",),
-         color=(240, 245, 250), skin=(250, 250, 255), hair=(220, 225, 235), hat=(40, 40, 60)),
-    dict(name="Громила с зонтом", hp=180, speed=80, time=55, flags=("shield", "acid"),
-         color=(30, 50, 110), skin=(190, 140, 100), hair=(30, 30, 30), hat=None),
-    dict(name="Киборг-директор", hp=260, speed=110, time=60, flags=("erratic", "shield", "regen"),
-         color=(80, 80, 100), skin=(170, 180, 190), hair=(60, 60, 70), hat=None),
-    dict(name="Песчаный страж", hp=340, speed=130, time=60, flags=("erratic", "regen", "acid"),
-         color=(170, 120, 50), skin=(200, 150, 100), hair=(90, 60, 30), hat=(220, 190, 110)),
-    dict(name="Лавовый голем", hp=460, speed=75, time=65, flags=("shield", "regen", "rage"),
-         color=(150, 40, 20), skin=(220, 90, 30), hair=(255, 160, 40), hat=None),
-    dict(name="Пришелец-капитан", hp=620, speed=150, time=70, flags=("ghost", "erratic", "blink"),
-         color=(90, 60, 160), skin=(120, 220, 150), hair=(60, 200, 120), hat=(200, 200, 230)),
-    # финальный босс: тёмная кожа, длинные волосы, белая одежда, чёрные джинсы
-    dict(name="Хозяйка вокзала", hp=900, speed=140, time=90,
-         flags=("erratic", "shield", "regen", "ghost", "rage", "acid"),
-         color=(245, 245, 248), skin=(112, 72, 48), hair=(18, 14, 14), hat=None,
-         pants=(18, 18, 24), long_hair=True),
-]
-FINAL_BOSS_KILLS = 2600
-BOSS_HP_MULT = 2.2      # во сколько раз больше HP у всех боссов
-BOSS_TIME_MULT = 0.9    # чуть меньше времени на босса
-BOSS_DMG_MAX = 41       # урон за клик при максимальной прокачке (1 + 2*20)
-BOSS_DMG_K = 7.0        # во сколько раз боссы жирнее при максимальном уроне
-
-
-def boss_dmg_scale(smash_lvl):
-    """HP босса растёт прямо пропорционально урону за клик: урон / 41 * K (но не меньше x1)."""
-    dmg = 1 + 2 * smash_lvl
-    return max(1.0, dmg / BOSS_DMG_MAX * BOSS_DMG_K)
-
-
-def boss_at(level):
-    """Сколько поездок нужно, чтобы вызвать босса этого уровня."""
-    return THEMES[level + 1]["kills"] if level < len(THEMES) - 1 else FINAL_BOSS_KILLS
-
-
-# ---------- улучшения (вкладка 0 — базовые, вкладка 1 — продвинутые) ----------
-UPGRADES = [
-    dict(key="power", tab=0, req=0, name="Сила толчка", label="Радиус", base=50, growth=1.9, max=10,
-         v=lambda l: f"{l * 35}px"),
-    dict(key="income", tab=0, req=0, name="Цена билета", label="Доход", base=30, growth=1.6, max=40,
-         v=lambda l: f"${round(10 * 1.35 ** l)}"),
-    dict(key="flow", tab=0, req=0, name="Поток людей", label="Приток", base=40, growth=1.55, max=15,
-         v=lambda l: f"x{1 + 0.25 * l:g}"),
-    dict(key="trains", tab=0, req=0, name="Частота поездов", label="Раз в", base=60, growth=1.6, max=12,
-         v=lambda l: f"{6 * 0.92 ** l:.1f}с"),
-    dict(key="helper", tab=0, req=0, name="Помощник", label="Толкает раз в", base=100, growth=1.7, max=8,
-         v=lambda l: "нет" if l == 0 else f"{max(0.6, 6.0 - 0.7 * (l - 1)):.1f}с"),
-    dict(key="combo", tab=0, req=0, name="Комбо", label="Макс. множитель", base=80, growth=1.65, max=12,
-         v=lambda l: f"x{1.5 + 0.5 * l:g}"),
-    dict(key="gold", tab=0, req=0, name="Золотые пассажиры", label="Шанс (x5)", base=120, growth=1.7, max=8,
-         v=lambda l: f"{(0.04 + 0.03 * l) * 100:.0f}%"),
-    dict(key="smash", tab=0, req=0, name="Удар по боссам", label="Урон за клик", base=60, growth=1.75, max=20,
-         v=lambda l: str(1 + 2 * l)),
-    # --- продвинутые: открываются по мере прохождения уровней ---
-    dict(key="crit", tab=1, req=1, name="Критический клик", label="Шанс крита x3", base=150, growth=1.7, max=10,
-         v=lambda l: f"{5 * l}%"),
-    dict(key="idle", tab=1, req=2, name="Пассивный доход", label="Доход", base=200, growth=1.65, max=15,
-         v=lambda l: f"${3 * l}/с"),
-    dict(key="gtrain", tab=1, req=3, name="Золотой поезд", label="Шанс (x3)", base=300, growth=1.75, max=10,
-         v=lambda l: f"{4 * l}%"),
-    dict(key="timebonus", tab=1, req=4, name="Время на боссов", label="Бонус", base=250, growth=1.7, max=8,
-         v=lambda l: f"+{5 * l}с"),
-    dict(key="bot", tab=1, req=5, name="Помощник-боец", label="Урон боссу/с", base=400, growth=1.7, max=12,
-         v=lambda l: str(2 * l)),
-    dict(key="mult", tab=1, req=6, name="Экспресс-билет", label="Весь доход", base=600, growth=1.75, max=20,
-         v=lambda l: f"x{1 + 0.15 * l:.2f}"),
-    dict(key="cap", tab=1, req=7, name="Вместимость", label="Людей на платформе", base=500, growth=1.8, max=6,
-         v=lambda l: str(14 + 2 * l)),
-    dict(key="combot", tab=1, req=8, name="Долгое комбо", label="Время комбо", base=700, growth=1.8, max=8,
-         v=lambda l: f"{6 + l}с"),
-]
-TAB_NAMES = ("Базовые", "Продвинутые", "Зелья")
-TAB_Y = 36
-ROWS_PER_TAB = 8
-ROW_Y0, ROW_H = 70, 76
-TAB_W, TAB_GAP = 96, 100        # три вкладки помещаются в панель шириной PW
-ITEM_TAB = 2
-HARD_LIVES = 5           # хардкор: столько жизней после 10-го уровня
-
-# ---------- расходники (вкладка «Зелья») ----------
-# dur > 0 — временный эффект, dur == 0 — мгновенное действие
-ITEMS = [
-    dict(key="p_flow", name="Зелье потока", dur=30, price=260,
-         desc="x2 приток людей, 30с"),
-    dict(key="p_train", name="Сжатое расписание", dur=45, price=340,
-         desc="поезда x2 чаще, 45с"),
-    dict(key="p_money", name="Двойная касса", dur=30, price=520,
-         desc="x2 весь доход, 30с"),
-    dict(key="p_power", name="Супер-толчок", dur=30, price=420,
-         desc="радиус клика x2, 30с"),
-    dict(key="grenade", name="Граната", dur=0, price=300,
-         desc="сбивает всех на платформе"),
-    dict(key="antidote", name="Противоядие", dur=0, price=150,
-         desc="смывает кислоту босса"),
-]
-FX_LABELS = {"p_flow": "Поток x2", "p_train": "Поезда x2",
-             "p_money": "Касса x2", "p_power": "Радиус x2"}
-
-
-def item_buy_rect(i):
-    """Кнопка покупки внутри строки предмета."""
-    return pygame.Rect(GW + PW - 122, ROW_Y0 + i * ROW_H + 34, 102, 26)
 
 
 def buy_item(s, i, g):
@@ -638,6 +608,7 @@ def buy_item(s, i, g):
         return
     s["money"] -= p
     s["items"][it["key"]] = s["items"].get(it["key"], 0) + 1
+    SND.play("buy", 0.8)
     g["toast"] = f"Куплено: {it['name']} (x{s['items'][it['key']]})"
     g["toast_col"] = (170, 240, 190)
     g["toast_t"] = 1.4
@@ -672,543 +643,47 @@ def use_item(s, i, g):
         g["fx"][k] = max(g["fx"].get(k, 0.0), float(it["dur"]))
         msg = f"{it['name']}: {FX_LABELS[k]} на {it['dur']}с"
     s["items"][k] -= 1
+    SND.play("power", 0.8)
     g["toast"] = msg
     g["toast_col"] = (170, 240, 190)
     g["toast_t"] = 1.8
 
 
-def tab_items(t):
-    return [i for i, u in enumerate(UPGRADES) if u["tab"] == t]
-
-
-def new_save():
-    return dict(money=0, earned=0, kills=0, level=0, won=False, skins=1,
-                levels={u["key"]: 0 for u in UPGRADES},
-                items={u["key"]: 0 for u in ITEMS})
-
-
 def load_save():
-    s = new_save()
-    try:
-        with open(SAVE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        s["money"] = int(d.get("money", 0))
-        # старые сейвы без «earned» берут баланс за стартовую экономику —
-        # иначе инфляция обнулилась бы у игрока с 280 миллиардами
-        s["earned"] = max(int(d.get("earned", 0)), s["money"])
-        s["kills"] = int(d.get("kills", 0))
-        s["level"] = max(0, min(len(THEMES) - 1, int(d.get("level", 0))))
-        s["won"] = bool(d.get("won", False))
-        s["skins"] = max(1, min(len(SKINS), int(d.get("skins", 1))))
-        for u in UPGRADES:
-            s["levels"][u["key"]] = max(0, min(u["max"], int(d.get("levels", {}).get(u["key"], 0))))
-        for u in ITEMS:
-            s["items"][u["key"]] = max(0, int(d.get("items", {}).get(u["key"], 0)))
-    except (OSError, ValueError, TypeError):
-        pass
-    return s
+    """Обёртка: путь к сейву остаётся в game.py (SAVE можно подменить в тестах)."""
+    return SAVES.load_save(SAVE)
 
 
 def write_save(s):
-    try:
-        with open(SAVE, "w", encoding="utf-8") as f:
-            json.dump(s, f)
-    except OSError:
-        pass
+    return SAVES.write_save(s, SAVE)
 
 
-# ---------- инфляция ----------
-# Цены привязаны к накопленному доходу s["earned"], а не к балансу: баланс тратится,
-# а инфляция назад не уходит. Израсходовано $10 000 экономики — платим базовую цену,
-# дальше множитель растёт линейно с доходом, поэтому граната за 280 млрд не стоит 300.
-INFL_DIV = 10_000
-
-
-def inflation(s):
-    """Множитель цен магазина: чем богаче экономика, тем дороже товар."""
-    return max(1.0, s.get("earned", s["money"]) / INFL_DIV)
-
-
-def up_infl(s):
-    """Улучшения и так растут с каждым уровнем, поэтому им хватает четвертого корня
-    инфляции: полный множитель сделал бы топовые прокачки недоступными — их цена
-    росла бы быстрее, чем баланс."""
-    return inflation(s) ** 0.25
-
-
-def item_price(it, s):
-    """Цена расходника с учётом инфляции."""
-    return int(it["price"] * inflation(s))
-
-
-def cost(u, lvl, infl=1.0):
-    return int(u["base"] * u["growth"] ** lvl * infl)
-
-
-def buy(s, i, g):
+def buy(s, i, g, times=1):
+    """Покупка уровня улучшения. times > 1 — Shift+клик: до 10 уровней сразу."""
     if not (0 <= i < len(UPGRADES)):
-        return
+        return 0
     u = UPGRADES[i]
     if s["level"] < u["req"]:
-        return
-    l = s["levels"][u["key"]]
-    c = cost(u, l, up_infl(s))
-    if l < u["max"] and s["money"] >= c:
+        return 0
+    n = 0
+    for _ in range(max(1, int(times))):
+        l = s["levels"][u["key"]]
+        if l >= u["max"]:
+            break
+        c = cost(u, l, up_infl(s))
+        if s["money"] < c:
+            break
         s["money"] -= c
         s["levels"][u["key"]] += 1
+        n += 1
+    if n:
+        SND.play("buy", 0.75)
         if u["key"] == "helper":
             g["helper_t"] = 0.0
+    return n
 
 
 # ---------- мир (фон, погода, платформа) ----------
-STRIP_H = 244                  # высота полосы с домами (логические пиксели)
-KEYCOL = (255, 0, 255)
-
-
-class World:
-    def __init__(self):
-        rnd = random.Random(7)
-        self.t = 0.0
-        self.cache = {}
-        self.clouds = [[rnd.uniform(0, GW), rnd.uniform(40, 220), rnd.uniform(0.7, 1.5), rnd.uniform(8, 22)]
-                       for _ in range(7)]
-        self.stars = [(rnd.uniform(0, GW), rnd.uniform(0, 300), rnd.uniform(0, 6)) for _ in range(90)]
-        self.snow = [[random.uniform(0, GW), random.uniform(0, H), random.uniform(40, 90),
-                      random.uniform(-15, 15), random.randint(2, 4)] for _ in range(150)]
-        self.rain = [[random.uniform(0, GW + 100), random.uniform(0, H), random.uniform(650, 900)]
-                     for _ in range(220)]
-        self.far = []
-        x = 0
-        while x < GW + 300:
-            w = rnd.randint(50, 110)
-            self.far.append((x, w, rnd.randint(60, 170)))
-            x += w + rnd.randint(0, 18)
-        self.far_span = x
-        self.far2 = []
-        x = 0
-        while x < GW + 300:
-            w = rnd.randint(40, 90)
-            self.far2.append((x, w, rnd.randint(110, 230)))
-            x += w + rnd.randint(0, 10)
-        self.far2_span = x
-        self.near = []
-        x = 0
-        while x < GW + 300:
-            w = rnd.randint(70, 130)
-            self.near.append((x, w, rnd.randint(100, 240), rnd.randint(0, 10 ** 6)))
-            x += w + rnd.randint(4, 30)
-        self.near_span = x
-        self.gravel = [(rnd.randint(0, GW), rnd.randint(TRAIN_Y + 6, H - 4), rnd.randint(1, 3), rnd.random())
-                       for _ in range(260)]
-        self.flash = 0.0
-        self.flash_t = random.uniform(4, 8)
-        self.flash_surf = None
-        self.flash_k = None
-
-    # --- кэш статичных слоёв: пересобирается только когда меняются цвета локации ---
-    def _ck(self, col, extra=()):
-        return (K,) + tuple(col[k] for k in KEYS) + (round(col["light"], 3),) + tuple(extra)
-
-    def _put(self, key, val):
-        self.cache[key] = val
-        while len(self.cache) > 48:
-            self.cache.pop(next(iter(self.cache)))
-        return val
-
-    def update(self, dt, kind):
-        self.t += dt
-        for c in self.clouds:
-            c[0] += c[3] * dt
-            if c[0] > GW + 160:
-                c[0] = -160
-        if kind == "snow":
-            for p in self.snow:
-                p[1] += p[2] * dt
-                p[0] += p[3] * dt
-                if p[1] > H:
-                    p[1] = -5
-                    p[0] = random.uniform(0, GW)
-        if kind == "lava":      # искры летят вверх
-            for p in self.snow:
-                p[1] -= p[2] * 1.4 * dt
-                p[0] += p[3] * dt
-                if p[1] < -5:
-                    p[1] = H + 5
-                    p[0] = random.uniform(0, GW)
-        if kind == "rain":
-            for d in self.rain:
-                d[1] += d[2] * dt
-                d[0] -= d[2] * 0.15 * dt
-                if d[1] > H:
-                    d[1] = -10
-                    d[0] = random.uniform(0, GW + 100)
-            self.flash_t -= dt
-            if self.flash_t <= 0:
-                self.flash = 1.0
-                self.flash_t = random.uniform(4, 9)
-        self.flash = max(0.0, self.flash - dt * 3)
-
-    def flash_surface(self):
-        if self.flash_surf is None or self.flash_k != K:
-            s = pygame.Surface((GWP, HP))
-            s.fill((255, 255, 255))
-            self.flash_surf = fast(s, False)
-            self.flash_k = K
-        return self.flash_surf
-
-    def sky(self, col, kind):
-        key = self._ck(col, ("sky", kind))
-        s = self.cache.get(key)
-        if s is None:
-            n = px(PLAT_TOP)
-            s = pygame.Surface((GWP, n))
-            for y in range(n):
-                s.fill(lerp_c(col["top"], col["bot"], (y / n) ** 0.9), (0, y, GWP, 1))
-            if kind != "finale":          # у финала светило пульсирует — оно рисуется каждый кадр
-                self.draw_body(s, col, kind)
-            s = self._put(key, fast(s, False))
-        return s
-
-    def haze(self, col):
-        key = self._ck(col, ("haze",))
-        s = self.cache.get(key)
-        if s is None:
-            n = px(150)
-            s = pygame.Surface((GWP, n), pygame.SRCALPHA)
-            c = col["bot"]
-            for y in range(n):
-                s.fill((c[0], c[1], c[2], int(170 * (y / n) ** 1.7)), (0, y, GWP, 1))
-            s = self._put(key, fast(s))
-        return s
-
-    def cloud(self, sc, ccol):
-        key = ("cloud", K, sc, ccol)
-        hit = self.cache.get(key)
-        if hit is None:
-            ox, oy = 28 * sc, 44 * sc
-            s = pygame.Surface((px(116 * sc), px(88 * sc)), pygame.SRCALPHA)
-            shade = lerp_c(ccol, (0, 0, 0), 0.10)
-            for dx, dy, r in ((0, 4, 26), (28, -6, 32), (60, 4, 26), (30, 12, 28)):
-                pygame.draw.circle(s, shade, (px(ox + dx * sc), px(oy + dy * sc)), max(1, px(r * sc)))
-            for dx, dy, r in ((0, 0, 26), (28, -10, 32), (60, 0, 26), (30, 8, 28)):
-                pygame.draw.circle(s, ccol, (px(ox + dx * sc), px(oy + dy * sc)), max(1, px(r * sc)))
-            hit = self._put(key, (fast(s), ox, oy))
-        return hit
-
-    def draw_body(self, surf, col, kind):
-        """Солнце, луна, планета и прочие светила."""
-        if kind == "day":
-            glow(surf, (720, 110), 150, (255, 240, 170), 90)
-            glow(surf, (720, 110), 80, (255, 245, 200), 120)
-            D.circle(surf, (255, 238, 140), (720, 110), 36)
-            D.circle(surf, (255, 250, 200), (714, 104), 22)
-        elif kind == "sunset":
-            glow(surf, (620, 330), 260, (255, 170, 90), 110)
-            D.circle(surf, (255, 205, 120), (620, 330), 70)
-            D.circle(surf, (255, 232, 160), (612, 322), 44)
-        elif kind == "night":
-            glow(surf, (730, 100), 120, (200, 210, 255), 70)
-            D.circle(surf, (235, 238, 250), (730, 100), 28)
-            D.circle(surf, (205, 210, 228), (720, 94), 5)
-            D.circle(surf, (205, 210, 228), (738, 108), 7)
-            D.circle(surf, (215, 220, 238), (736, 90), 3)
-        elif kind == "neon":
-            glow(surf, (700, 250), 260, (255, 60, 160), 100)
-            D.circle(surf, (255, 110, 170), (700, 250), 85)
-            D.circle(surf, (255, 170, 200), (700, 250), 85, 3)
-            for k in range(5):
-                D.rect(surf, col["near"], (615, 262 + k * 14, 170, 3 + k))
-        elif kind == "desert":
-            glow(surf, (720, 150), 220, (255, 200, 100), 110)
-            D.circle(surf, (255, 218, 110), (720, 150), 54)
-            D.circle(surf, (255, 240, 170), (712, 142), 34)
-        elif kind == "lava":
-            D.polygon(surf, col["near"], [(430, PLAT_TOP), (590, 190), (670, 190), (830, PLAT_TOP)])
-            D.polygon(surf, lerp_c(col["near"], (255, 120, 40), 0.18),
-                      [(590, 190), (670, 190), (700, 260), (560, 260)])
-            glow(surf, (630, 190), 170, (255, 100, 30), 150)
-            D.ellipse(surf, (255, 130, 40), (592, 183, 76, 15))
-            D.ellipse(surf, (255, 210, 110), (608, 186, 44, 8))
-        elif kind == "space":
-            glow(surf, (700, 170), 180, (160, 120, 255), 70)
-            D.circle(surf, (130, 100, 210), (700, 170), 62)
-            D.circle(surf, (160, 130, 235), (686, 156), 40)
-            D.ellipse(surf, (210, 190, 255), (606, 152, 188, 38), 3)
-            D.circle(surf, (190, 190, 215), (260, 150), 16)
-            D.circle(surf, (160, 160, 190), (255, 146), 4)
-        elif kind == "finale":
-            pulse = 0.5 + 0.5 * math.sin(self.t * 2)
-            glow(surf, (700, 170), 230, (255, 60, 200), int(70 + 60 * pulse))
-            D.circle(surf, (8, 0, 14), (700, 170), 56)
-            D.circle(surf, (255, 200, 240), (700, 170), 56, 3)
-            D.circle(surf, (255, 120, 220), (700, 170), 64 + int(4 * pulse), 1)
-
-    # --- полосы с домами: рисуются один раз и просто едут по экрану ---
-    def strip(self, which, col, kind):
-        key = self._ck(col, ("strip", which, kind))
-        hit = self.cache.get(key)
-        if hit is not None:
-            return hit
-        light = col["light"]
-        span = {"far2": self.far2_span, "far": self.far_span, "near": self.near_span}[which]
-        s = pygame.Surface((px(span), px(STRIP_H)))
-        s.fill(KEYCOL)
-        if which == "far2":
-            pale = lerp_c(col["far"], col["bot"], 0.55)
-            for (x, w, h) in self.far2:
-                D.rect(s, pale, (x, STRIP_H - h, w, h))
-        elif which == "far":
-            for (x, w, h) in self.far:
-                D.rect(s, col["far"], (x, STRIP_H - h, w, h))
-                D.line(s, lerp_c(col["far"], (255, 255, 255), 0.18), (x, STRIP_H - h), (x + w, STRIP_H - h), 2)
-        else:
-            wcol = lerp_c(col["near"], col["bot"], 0.35)
-            for (x, w, h, seed) in self.near:
-                top = STRIP_H - h
-                D.rect(s, col["near"], (x, top, w, h))
-                D.rect(s, lerp_c(col["near"], (255, 255, 255), 0.10), (x, top, 4, h))
-                D.rect(s, lerp_c(col["near"], (0, 0, 0), 0.25), (x + w - 5, top, 5, h))
-                D.rect(s, lerp_c(col["near"], (255, 255, 255), 0.16), (x, top, w, 4))
-                if kind == "neon":
-                    D.rect(s, (255, 60, 200), (x, top, w, h), 2)
-                if kind == "finale":
-                    D.rect(s, (200, 80, 220), (x, top, w, h), 1)
-                if light > 0.4:
-                    for r in range(h // 22):
-                        for c in range(w // 18):
-                            hsh = (seed + r * 31 + c * 17) % 5
-                            if hsh < 2:
-                                if kind == "neon":
-                                    wc = (0, 230, 230) if hsh == 0 else (255, 90, 200)
-                                elif kind == "lava":
-                                    wc = (255, 120, 40)
-                                elif kind == "space":
-                                    wc = (140, 220, 255)
-                                elif kind == "finale":
-                                    wc = (255, 120, 220) if hsh == 0 else (255, 255, 255)
-                                else:
-                                    wc = (255, 215, 120)
-                                D.rect(s, wc, (x + 8 + c * 18, top + 10 + r * 22, 7, 10))
-                else:
-                    # дневные окна: тёмные стёкла
-                    for r in range(h // 22):
-                        for c in range(w // 18):
-                            if (seed + r * 31 + c * 17) % 5 < 3:
-                                D.rect(s, wcol, (x + 8 + c * 18, top + 10 + r * 22, 7, 10))
-        s = fast(s, False)
-        s.set_colorkey(KEYCOL)
-        return self._put(key, (s, span))
-
-    def blit_strip(self, surf, which, col, kind, speed):
-        s, span = self.strip(which, col, kind)
-        bx = -((self.t * speed) % span) - 150
-        y = px(PLAT_TOP - STRIP_H)
-        surf.blit(s, (px(bx), y))
-        if bx + span < GW:
-            surf.blit(s, (px(bx + span), y))
-
-    # --- платформа, пути и всё, что лежит ниже горизонта: тоже один раз ---
-    def ground(self, col):
-        key = self._ck(col, ("ground",))
-        s = self.cache.get(key)
-        if s is not None:
-            return s
-        light = col["light"]
-        s = pygame.Surface((GWP, HP))
-        s.fill((0, 0, 0))
-        # платформа: градиент, швы плитки, фаска
-        top_c = lerp_c(col["plat"], (255, 255, 255), 0.10)
-        bot_c = lerp_c(col["plat"], (0, 0, 0), 0.16)
-        vband(s, 0, GW, PLAT_TOP, PLAT_BOT, top_c, bot_c)
-        dark = lerp_c(col["plat"], (0, 0, 0), 0.20)
-        lite = lerp_c(col["plat"], (255, 255, 255), 0.14)
-        for x in range(0, GW, 80):
-            D.line(s, dark, (x, PLAT_TOP + 4), (x - 10, PLAT_BOT - 9), 2)
-            D.line(s, lite, (x + 2, PLAT_TOP + 4), (x - 8, PLAT_BOT - 9), 1)
-        D.line(s, dark, (0, PLAT_TOP + 30), (GW, PLAT_TOP + 30), 1)
-        D.line(s, lerp_c(col["plat"], (255, 255, 255), 0.4), (0, PLAT_TOP), (GW, PLAT_TOP), 3)
-        # жёлтая полоса безопасности
-        D.rect(s, (240, 205, 30), (0, PLAT_BOT - 9, GW, 9))
-        D.line(s, (255, 235, 110), (0, PLAT_BOT - 9), (GW, PLAT_BOT - 9), 1)
-        for x in range(0, GW, 28):
-            D.polygon(s, (60, 50, 10), [(x, PLAT_BOT), (x + 12, PLAT_BOT),
-                                        (x + 18, PLAT_BOT - 9), (x + 6, PLAT_BOT - 9)])
-        # фронтальная стенка платформы: кирпичная кладка с градиентом
-        fw_top = lerp_c(col["front"], (255, 255, 255), 0.06)
-        fw_bot = lerp_c(col["front"], (0, 0, 0), 0.30)
-        vband(s, 0, GW, PLAT_BOT, TRAIN_Y, fw_top, fw_bot)
-        seam = lerp_c(col["front"], (0, 0, 0), 0.38)
-        for row in range(3):
-            yy = PLAT_BOT + row * 6
-            D.line(s, seam, (0, yy), (GW, yy), 1)
-            for x in range(12 if row % 2 else 0, GW, 24):
-                D.line(s, seam, (x, yy), (x, yy + 6), 1)
-        # путевая зона
-        bed_top = lerp_c(col["bed"], (0, 0, 0), 0.38)
-        bed_bot = lerp_c(col["bed"], (0, 0, 0), 0.12)
-        for py in range(px(TRAIN_Y), HP):
-            t = min(1.0, (py / K - TRAIN_Y) / 60)
-            s.fill(lerp_c(bed_top, bed_bot, t), (0, py, GWP, 1))
-        D.rect(s, lerp_c(col["bed"], (0, 0, 0), 0.30), (0, H - 80, GW, 80))
-        for (gx, gy, gs, gv) in self.gravel:
-            gc = lerp_c(col["bed"], (255, 255, 255) if gv > 0.5 else (0, 0, 0), 0.12 + 0.18 * gv)
-            D.rect(s, gc, (gx, gy, gs + 1, gs))
-        wood = lerp_c((105, 82, 62), (25, 22, 35), 0.6 * min(1.0, light))
-        for x in range(-20, GW, 52):
-            D.rect(s, lerp_c(wood, (0, 0, 0), 0.35), (x + 2, 601, 30, 46), border_radius=2)
-            D.rect(s, wood, (x, 598, 30, 46), border_radius=2)
-            D.line(s, lerp_c(wood, (255, 255, 255), 0.18), (x + 2, 600), (x + 28, 600), 2)
-        for ry in (602, 636):
-            D.rect(s, lerp_c(col["rail"], (0, 0, 0), 0.45), (0, ry + 3, GW, 5))
-            D.rect(s, col["rail"], (0, ry, GW, 6))
-            D.line(s, lerp_c(col["rail"], (255, 255, 255), 0.55), (0, ry), (GW, ry), 1)
-        return self._put(key, fast(s, False))
-
-    def draw_back(self, surf, col, kind, name):
-        light = col["light"]
-        surf.blit(self.sky(col, kind), (0, 0))
-
-        if kind in STAR_KINDS:
-            sz = max(1, int(K))
-            for (x, y, ph) in self.stars:
-                v = int(150 + 100 * math.sin(self.t * 2 + ph))
-                v = max(0, min(255, v))
-                surf.fill((v, v, v), (px(x), px(y), sz, sz))
-                if v > 220:
-                    glow(surf, (x, y), 6, (200, 210, 255), 90)
-        if kind == "finale":
-            self.draw_body(surf, col, kind)
-
-        for (x, y, sc, _sp) in self.clouds:
-            spr, ox, oy = self.cloud(sc, col["cloud"])
-            surf.blit(spr, (px(x - ox), px(y - oy)))
-
-        self.blit_strip(surf, "far2", col, kind, 3)
-        self.blit_strip(surf, "far", col, kind, 6)
-        self.blit_strip(surf, "near", col, kind, 14)
-
-        # дымка у горизонта
-        surf.blit(self.haze(col), (0, px(PLAT_TOP - 150)))
-
-        # платформа и пути (готовая картинка)
-        gy = px(PLAT_TOP)
-        surf.blit(self.ground(col), (0, gy), (0, gy, GWP, HP - gy))
-
-        # табличка станции
-        for p in (200, 410):
-            D.rect(surf, (45, 45, 58), (p - 3, 286, 6, PLAT_TOP - 286))
-            D.rect(surf, (90, 90, 108), (p - 3, 286, 2, PLAT_TOP - 286))
-        if light > 0.4:
-            glow(surf, (305, 261), 170, (90, 150, 255), int(70 * light))
-        D.rect(surf, (10, 14, 26), (183, 241, 250, 50), border_radius=8)
-        D.rect(surf, (24, 60, 110), (180, 236, 250, 50), border_radius=8)
-        D.rect(surf, (40, 92, 160), (183, 239, 244, 20), border_radius=6)
-        D.rect(surf, (235, 240, 250), (180, 236, 250, 50), 3, border_radius=8)
-        for bx in (190, 420):
-            D.circle(surf, (255, 235, 150), (bx, 261), 2)
-        text(surf, f"Станция «{name}»", f_mid, (255, 255, 255), (305, 250), center=True, shadow=False)
-
-        # фонари
-        for lx in (110, 500, 850):
-            if light > 0.25:
-                cone = LAMP_CONE
-                cone.set_alpha(int(255 * min(1.0, light)))
-                surf.blit(cone, (px(lx) - cone.get_width() // 2, px(282)))
-            D.rect(surf, (40, 40, 52), (lx - 3, 270, 6, PLAT_TOP - 270))
-            D.rect(surf, (80, 80, 98), (lx - 3, 270, 2, PLAT_TOP - 270))
-            D.rect(surf, (40, 40, 52), (lx - 24, 262, 48, 10), border_radius=4)
-            D.rect(surf, (74, 74, 90), (lx - 24, 262, 48, 3), border_radius=2)
-            D.circle(surf, lerp_c((200, 200, 185), (255, 235, 160), light), (lx, 278), 7)
-            if light > 0.25:
-                glow(surf, (lx, 282), 130, (255, 230, 150), int(110 * light))
-
-    def draw_front(self, surf, kind):
-        if kind == "snow":
-            for (x, y, _s, _d, r) in self.snow:
-                D.circle(surf, (255, 255, 255), (int(x), int(y)), r)
-                if r > 3:
-                    D.circle(surf, (225, 236, 250), (int(x) + 1, int(y) + 1), r - 1)
-        elif kind == "lava":
-            for (x, y, _s, _d, r) in self.snow:
-                glow(surf, (x, y), r * 4, (255, 120, 40), 90)
-                D.circle(surf, (255, 190, 80), (int(x), int(y)), max(1, r - 1))
-        elif kind == "rain":
-            for (x, y, _s) in self.rain:
-                D.line(surf, (175, 195, 220), (int(x), int(y)), (int(x) - 4, int(y) + 14), 1)
-                if PLAT_BOT - 22 < y < PLAT_BOT - 14:     # всплеск на платформе
-                    D.ellipse(surf, (200, 215, 235), (int(x) - 4, int(y) + 6, 8, 3), 1)
-            if self.flash > 0:
-                fs = self.flash_surface()
-                fs.set_alpha(int(150 * self.flash))
-                surf.blit(fs, (0, 0))
-
-
-# ---------- объекты ----------
-# обычный, жирный (несколько ударов), летающий (парит), спринтер (быстрый),
-# бронированный (падает только от прямого клика), бомба (взрывается и сбивает соседей)
-KIND_HP = {"normal": 1, "fat": 3, "fly": 2, "sprint": 1, "armor": 2, "bomb": 1}
-KIND_VALUE = {"normal": 1, "fat": 3, "fly": 3, "sprint": 2, "armor": 2.5, "bomb": 2}
-
-# реплики людей на платформе — для веселья
-WALK_QUOTES = ("Я опаздываю!", "Где мой кофе?", "Какой хороший день", "Это моя остановка?",
-               "Ммм, пончики", "Я забыл утюг!", "Не толкаться!", "Поезд не видели?",
-               "Опять задерживают...", "Мама, я в телевизоре!")
-FALL_QUOTES = ("А-А-А!", "Мама!", "Мой телефон!", "Только не это!", "Ой-ой-ой!", "Я не хочу!",
-               "Передайте жене...")
-BOMB_QUOTES = ("Тик-так...", "Я не бомба!", "Не трогай меня!", "Я просто пассажир")
-
-# ---------- скины прохожих: награда за забеги в хардкоре ----------
-# 0 («Классика») открыт всегда, остальные выдаются по одному за каждый
-# проигранный забег — на платформе бегают люди в этих нарядах.
-SKINS = [
-    dict(name="Классика"),
-    dict(name="Дед Мороз", color=(200, 44, 44), skin=(245, 210, 170), hair=(240, 240, 245), extra="hat"),
-    dict(name="Киборг", color=(118, 130, 152), skin=(175, 185, 195), hair=(60, 66, 78), extra="visor"),
-    dict(name="Призрак", color=(206, 228, 255), skin=(225, 235, 250), hair=(200, 215, 240),
-         glow=(150, 200, 255)),
-    dict(name="Неон", color=(40, 255, 200), skin=(198, 255, 240), hair=(20, 40, 36), glow=(0, 255, 200)),
-    dict(name="Пират", color=(72, 52, 42), hair=(30, 24, 20), extra="tricorn", eyepatch=True),
-    dict(name="Астронавт", color=(234, 240, 248), skin=(200, 210, 225), hair=(180, 190, 205),
-         extra="helmet", glow=(180, 210, 255)),
-    dict(name="Дьявол", color=(168, 32, 32), skin=(198, 62, 52), hair=(30, 12, 12),
-         extra="horns", glow=(255, 70, 40)),
-    dict(name="Золотой", color=(252, 202, 44), skin=(252, 224, 132), hair=(150, 110, 30),
-         extra="crown", glow=(255, 210, 60)),
-    dict(name="Кот", color=(92, 92, 122), hair=(40, 40, 56), extra="ears"),
-    dict(name="Король", color=(122, 44, 162), hair=(24, 18, 30), extra="crown", glow=(200, 120, 255)),
-    dict(name="Ледяной", color=(122, 192, 242), skin=(214, 238, 255), hair=(230, 246, 255),
-         glow=(140, 210, 255)),
-]
-
-
-def pick_skin(s):
-    """Шанс украсить прохожего одним из уже открытых нарядов."""
-    n = max(1, min(len(SKINS), s.get("skins", 1)))
-    if n > 1 and random.random() < 0.3:
-        return random.randrange(1, n)
-    return 0
-
-
-def skull_chance(level, base):
-    """Череп летит в камеру всё реже — с каждым новым уровнем в 0.7 раза."""
-    return max(0.004, base * 0.7 ** level)
-
-
-def pick_kind(kills):
-    """Чем дальше игрок, тем разнообразнее (и злее) публика на платформе."""
-    ramp = 1.0 + min(1.0, kills / 2500.0)
-    pool = [("normal", 100)]
-    for kind, w, need in (("fat", 16, 30), ("bomb", 9, 45), ("sprint", 14, 80),
-                          ("fly", 12, 200), ("armor", 12, 400)):
-        if kills >= need:
-            pool.append((kind, w * ramp))
-    total = sum(w for _, w in pool)
-    r = random.uniform(0, total)
-    for kind, w in pool:
-        r -= w
-        if r <= 0:
-            return kind
-    return "normal"
 
 
 class Person:
@@ -1358,12 +833,17 @@ class Person:
             # хардкор: человек почти дошёл до края и сейчас уйдёт с платформы
             text(surf, "!", f_mid, (255, 60, 50), (x, y - 134), center=True)
         if self.quote_t > 0 and self.state in ("walk", "fall") and self.quote:
-            # облачко с репликой
+            # облачко с репликой; табличку станции и соседние облачка не перекрываем
             bw = int(twidth(f_small, self.quote)) + 16
             by = int(y - 160) if self.state == "walk" else int(y - 130)
             bx = max(2, min(GW - bw - 2, x - bw // 2))
-            plate(surf, (bx, by, bw, 22), 235, 9, color=(250, 250, 255), border=(40, 40, 60, 200))
-            text(surf, self.quote, f_small, (22, 22, 40), (bx + bw // 2, by + 3), center=True, shadow=False)
+            box = pygame.Rect(bx, by, bw, 22)
+            if not box.colliderect(SIGN_RECT) and not any(box.colliderect(q) for q in QUOTE_BOXES):
+                QUOTE_BOXES.append(box)
+                plate(surf, (bx, by, bw, 22), 235, 9, color=(250, 250, 255),
+                      border=(40, 40, 60, 200))
+                text(surf, self.quote, f_small, (22, 22, 40), (bx + bw // 2, by + 3),
+                     center=True, shadow=False)
 
     def sprite(self, zoom=1.0, deco=None, deco_key=None):
         """Готовая картинка человека; кадры анимации кэшируются (шаг ноги — 2 px)."""
@@ -1383,9 +863,7 @@ class Person:
         if fig is None:
             fig = self._build(sq, flap, scared, zoom, deco)
             SPR[key] = fig
-            if len(SPR) > 600:
-                for _ in range(150):
-                    SPR.pop(next(iter(SPR)))
+            spr_trim()
         return fig
 
     def _build(self, swing, flap, scared, zoom, deco):
@@ -1409,15 +887,20 @@ class Person:
                     D.line(fig, (255, 255, 255), (cx - 24 * d, yy), (cx - (36 + 7 * k) * d, yy), 2)
             if self.long_hair:      # длинные волосы за спиной
                 D.rect(fig, self.hair, (cx - 14, fy - 83, 28, 52), border_radius=11)
-            if self.kind == "fly":       # крылья уходят назад за спину
+            if self.kind == "fly":       # крылья: три пера с переливом
                 for sgn in (-1, 1):
-                    wx = cx + sgn * 8
-                    pts = [(wx, fy - 60),
-                           (wx + sgn * 32, fy - 74 - flap),
-                           (wx + sgn * 40, fy - 58),
-                           (wx + sgn * 26, fy - 44)]
-                    D.polygon(fig, (224, 240, 255), pts)
-                    D.polygon(fig, (150, 190, 235), pts, 2)
+                    wx = cx + sgn * 9
+                    for fi, (ln, up, lift) in enumerate(((29, 14, 0.0), (23, 22, 0.14), (16, 28, 0.26))):
+                        tipx = wx + sgn * (ln - fi * 5)
+                        tipy = fy - 48 - up - flap
+                        pts = [(wx, fy - 56), (tipx, tipy),
+                               (tipx - sgn * 7, tipy + 13 + fi * 2), (wx + sgn * 5, fy - 44)]
+                        D.polygon(fig, lerp_c((204, 226, 250), (255, 255, 255), lift), pts)
+                        D.polygon(fig, (146, 184, 228), pts, 2)
+                    D.circle(fig, (198, 220, 246), (wx, fy - 52), 4)
+            # плечи, затем корпус
+            D.rect(fig, self.color, (cx - 11, fy - 63, 22, 8), border_radius=4)
+            D.rect(fig, lerp_c(self.color, (0, 0, 0), 0.22), (cx - 11, fy - 61, 22, 2), border_radius=1)
             D.rect(fig, self.color, (cx - 9, fy - 62, 18, 34), border_radius=6)
             if self.kind == "fat":
                 D.rect(fig, self.color, (cx - 17, fy - 58, 34, 40), border_radius=13)
@@ -1443,6 +926,12 @@ class Person:
             D.circle(fig, self.hair, (cx, fy - 76), 11)
             D.circle(fig, self.skin, (cx, fy - 71), 10)
             D.circle(fig, lerp_c(self.skin, (255, 255, 255), 0.18), (cx - 3 * d, fy - 74), 4)
+            if not scared:      # ведущий глаз и рот — лицо читается даже крошечным
+                eye = lerp_c(self.skin, (0, 0, 0), 0.76)
+                D.circle(fig, eye, (cx + 4 * d, fy - 74), 2)
+                D.circle(fig, lerp_c(self.skin, (0, 0, 0), 0.34), (cx + 1 * d, fy - 70), 1)
+                D.line(fig, lerp_c(self.skin, (0, 0, 0), 0.40),
+                       (cx + 2 * d, fy - 66), (cx + 6 * d, fy - 66), 1)
             if self.long_hair:      # пряди по бокам лица
                 D.rect(fig, self.hair, (cx - 12, fy - 77, 4, 26), border_radius=2)
                 D.rect(fig, self.hair, (cx + 8, fy - 77, 4, 26), border_radius=2)
@@ -1777,286 +1266,6 @@ for _i, _f in _EXTRA_S.items():
 HOVER = {"bat": -34, "octopus": -26, "skull": -30}      # эти боссы парят над платформой
 
 
-def _c_pigeon(fig, p, q):
-    grey, dk, lt = (150, 160, 178), (108, 118, 138), (196, 204, 218)
-    D.polygon(fig, dk, [(52, 128), (14, 148), (18, 168), (60, 158)])
-    for sg in (1, -1):
-        lx = 110 + sg * 10 + p * sg * 8
-        D.line(fig, (240, 150, 50), (110 + sg * 10, 188), (lx, 211), 6)
-        D.line(fig, (240, 150, 50), (lx, 211), (lx + 16, 213), 5)
-    D.ellipse(fig, grey, (46, 110, 128, 84))
-    D.ellipse(fig, lt, (70, 138, 84, 48))
-    D.ellipse(fig, dk, (54, 118, 82, 50))
-    D.ellipse(fig, (70, 170, 120), (138, 104, 36, 30))
-    D.circle(fig, grey, (176, 96), 26)
-    D.circle(fig, lt, (168, 90), 8)
-    D.polygon(fig, (250, 170, 40), [(196, 92), (228, 102), (196, 112)])
-    D.circle(fig, (255, 255, 255), (184, 90), 7)
-    D.circle(fig, (210, 30, 30), (186, 91), 4)
-    D.line(fig, (20, 20, 30), (174, 80), (194, 88), 3)
-
-
-def _c_cat(fig, p, q):
-    orange, dk, lt = (226, 142, 58), (176, 98, 36), (250, 214, 160)
-    D.lines(fig, orange, False, [(54, 140), (26, 120 + p * 10), (20, 86 + p * 12), (36, 60 + p * 10)], 12)
-    for lx, off in ((70, p), (92, -p), (148, -p), (170, p)):
-        D.rect(fig, dk, (lx - 8 + off * 6, 160, 16, 50), border_radius=6)
-        D.ellipse(fig, orange, (lx - 12 + off * 6, 200, 26, 14))
-    D.ellipse(fig, orange, (50, 104, 140, 84))
-    D.ellipse(fig, lt, (78, 150, 86, 34))
-    for sx in (76, 104, 132):
-        D.line(fig, dk, (sx, 108), (sx - 6, 132), 5)
-    D.circle(fig, orange, (188, 104), 34)
-    D.polygon(fig, orange, [(164, 84), (166, 50), (188, 74)])
-    D.polygon(fig, orange, [(196, 72), (214, 48), (220, 92)])
-    D.polygon(fig, (240, 150, 150), [(168, 78), (169, 60), (182, 74)])
-    D.rect(fig, (210, 30, 40), (158, 82, 60, 9))
-    D.polygon(fig, (210, 30, 40), [(158, 86), (140, 100 + p * 4), (144, 84)])
-    D.ellipse(fig, (255, 235, 60), (190, 96, 16, 12))
-    D.ellipse(fig, (255, 235, 60), (166, 98, 14, 11))
-    D.line(fig, (10, 10, 10), (198, 94), (198, 108), 3)
-    D.circle(fig, (240, 120, 130), (218, 112), 5)
-    D.line(fig, (255, 255, 255), (214, 118), (240, 110), 2)
-    D.line(fig, (255, 255, 255), (214, 122), (240, 126), 2)
-
-
-def _c_bat(fig, p, q):
-    fl = p * 14
-    for sg in (-1, 1):
-        c0 = 120
-        pts = [(c0 + sg * 14, 96), (c0 + sg * 70, 40 - fl), (c0 + sg * 112, 70 - fl),
-               (c0 + sg * 96, 98), (c0 + sg * 78, 92), (c0 + sg * 64, 122),
-               (c0 + sg * 44, 106), (c0 + sg * 26, 140)]
-        D.polygon(fig, (74, 42, 104), pts)
-        D.polygon(fig, (40, 20, 70), pts, 3)
-    D.ellipse(fig, (52, 34, 70), (94, 80, 52, 92))
-    D.ellipse(fig, (84, 62, 104), (104, 104, 32, 50))
-    D.polygon(fig, (150, 20, 40), [(100, 96), (140, 96), (152, 116), (88, 116)])
-    D.circle(fig, (62, 42, 84), (120, 72), 26)
-    D.polygon(fig, (62, 42, 84), [(100, 60), (96, 26), (116, 50)])
-    D.polygon(fig, (62, 42, 84), [(140, 60), (144, 26), (124, 50)])
-    for ex in (110, 130):
-        D.circle(fig, (255, 40, 40), (ex, 70), 6)
-        D.circle(fig, (255, 220, 200), (ex, 69), 2)
-    D.polygon(fig, (255, 255, 255), [(113, 86), (118, 86), (115, 99)])
-    D.polygon(fig, (255, 255, 255), [(122, 86), (127, 86), (125, 99)])
-    D.line(fig, (52, 34, 70), (112, 168), (106, 190), 6)
-    D.line(fig, (52, 34, 70), (128, 168), (134, 190), 6)
-
-
-def _c_yeti(fig, p, q):
-    fur, sh, belly = (236, 242, 250), (188, 204, 226), (214, 226, 242)
-    D.rect(fig, sh, (84, 170, 32, 40), border_radius=10)
-    D.rect(fig, sh, (124, 170, 32, 40), border_radius=10)
-    D.ellipse(fig, fur, (76, 198, 44, 18))
-    D.ellipse(fig, fur, (120, 198, 44, 18))
-    D.line(fig, fur, (86, 100), (52, 150 + p * 12), 24)
-    D.line(fig, fur, (154, 100), (192, 150 - p * 12), 24)
-    D.circle(fig, sh, (52, 152 + p * 12), 14)
-    D.circle(fig, sh, (192, 152 - p * 12), 14)
-    D.ellipse(fig, fur, (70, 80, 100, 110))
-    D.ellipse(fig, belly, (92, 112, 56, 62))
-    D.circle(fig, fur, (120, 68), 34)
-    D.ellipse(fig, (128, 160, 214), (98, 56, 44, 40))
-    for ex in (110, 130):
-        D.circle(fig, (255, 255, 255), (ex, 66), 6)
-        D.circle(fig, (20, 40, 90), (ex, 67), 3)
-    D.line(fig, (30, 50, 100), (102, 57), (116, 64), 3)
-    D.line(fig, (30, 50, 100), (138, 57), (124, 64), 3)
-    D.rect(fig, (40, 30, 60), (108, 80, 24, 10), border_radius=3)
-    D.polygon(fig, (255, 255, 255), [(110, 80), (115, 80), (112, 88)])
-    D.polygon(fig, (255, 255, 255), [(125, 80), (130, 80), (128, 88)])
-    D.polygon(fig, (150, 210, 255), [(96, 42), (101, 14), (110, 38)])
-    D.polygon(fig, (150, 210, 255), [(144, 42), (139, 14), (130, 38)])
-
-
-def _c_frog(fig, p, q):
-    g1, g2, lt = (84, 164, 72), (54, 120, 50), (196, 230, 140)
-    D.ellipse(fig, g2, (40, 140, 60, 66))
-    D.rect(fig, g2, (30, 196, 70, 14), border_radius=6)
-    D.rect(fig, g2, (150 + p * 4, 170, 18, 40), border_radius=6)
-    D.ellipse(fig, g1, (40, 96, 150, 100))
-    D.ellipse(fig, lt, (80, 150, 90, 44))
-    for wx, wy in ((70, 120), (104, 108), (140, 118), (88, 138)):
-        D.circle(fig, g2, (wx, wy), 5)
-    D.ellipse(fig, g1, (120, 76, 100, 62))
-    for ex in (150, 192):
-        D.circle(fig, g1, (ex, 64), 22)
-        D.circle(fig, (255, 230, 80), (ex, 64), 14)
-        D.ellipse(fig, (10, 10, 10), (ex - 3, 52, 6, 24))
-    D.line(fig, (30, 70, 30), (130, 112), (216, 118), 4)
-    D.line(fig, (230, 80, 110), (216, 118), (232, 130 + p * 6), 6)
-    D.circle(fig, (240, 240, 120), (118, 118), 3)
-
-
-def _c_robot(fig, p, q):
-    steel, dk, neon, mag = (150, 160, 180), (70, 76, 96), (0, 230, 230), (255, 70, 200)
-    D.rect(fig, dk, (92, 160, 26, 50))
-    D.rect(fig, dk, (124, 160, 26, 50))
-    D.rect(fig, steel, (86, 200, 40, 14), border_radius=4)
-    D.rect(fig, steel, (120, 200, 40, 14), border_radius=4)
-    D.line(fig, dk, (76, 96), (48, 130 + p * 10), 16)
-    D.line(fig, dk, (168, 96), (198, 130 - p * 10), 16)
-    D.polygon(fig, steel, [(38, 128 + p * 10), (60, 128 + p * 10), (49, 154 + p * 10)])
-    D.polygon(fig, steel, [(188, 128 - p * 10), (210, 128 - p * 10), (199, 154 - p * 10)])
-    D.rect(fig, steel, (76, 80, 92, 88), border_radius=12)
-    D.rect(fig, dk, (88, 96, 68, 50), border_radius=8)
-    D.circle(fig, neon, (122, 120), 14)
-    D.circle(fig, (220, 255, 255), (122, 120), 6)
-    for i in range(3):
-        D.rect(fig, mag, (94 + i * 16, 152, 10, 5))
-    D.rect(fig, neon, (76, 80, 92, 88), 2, border_radius=12)
-    D.rect(fig, steel, (92, 38, 60, 44), border_radius=10)
-    D.rect(fig, neon, (98, 52, 48, 12), border_radius=4)
-    D.rect(fig, (255, 60, 60), (118 + p * 14, 54, 8, 8))
-    D.line(fig, dk, (122, 38), (122, 14), 4)
-    D.circle(fig, mag, (122, 12), 6)
-
-
-def _c_scorpion(fig, p, q):
-    tan, dk, lt = (206, 150, 70), (146, 98, 40), (236, 190, 110)
-    for i in range(4):
-        bx = 70 + i * 24
-        sw = p * 6 if i % 2 else -p * 6
-        D.lines(fig, dk, False, [(bx, 170), (bx - 10 + sw, 196), (bx - 14, 212)], 6)
-    pts = [(54, 150), (30, 132), (24, 100), (40, 70), (70, 52), (98, 56 + p * 4)]
-    D.lines(fig, tan, False, pts, 16)
-    for i, pt in enumerate(pts):
-        D.circle(fig, lt if i % 2 else tan, pt, 9)
-    D.polygon(fig, (220, 40, 40), [(96, 42 + p * 4), (130, 64 + p * 4), (98, 72 + p * 4)])
-    D.ellipse(fig, tan, (52, 138, 120, 56))
-    for sx in (74, 98, 122):
-        D.line(fig, dk, (sx, 142), (sx, 190), 3)
-    D.ellipse(fig, tan, (150, 146, 44, 42))
-    D.circle(fig, (255, 50, 50), (184, 152), 5)
-    D.line(fig, dk, (176, 160), (206, 140 + p * 8), 10)
-    D.polygon(fig, tan, [(200, 126 + p * 8), (238, 138 + p * 8), (212, 154 + p * 8)])
-    D.polygon(fig, dk, [(200, 126 + p * 8), (238, 138 + p * 8), (212, 154 + p * 8)], 2)
-
-
-def _c_dino(fig, p, q):
-    red, dk, lt = (176, 52, 32), (120, 30, 22), (236, 150, 70)
-    D.polygon(fig, red, [(70, 120), (8, 168 + p * 4), (14, 186), (86, 168)])
-    D.rect(fig, dk, (96 + p * 6, 150, 30, 52), border_radius=8)
-    D.ellipse(fig, dk, (90 + p * 6, 196, 52, 18))
-    D.rect(fig, dk, (132 - p * 6, 150, 30, 52), border_radius=8)
-    D.ellipse(fig, dk, (126 - p * 6, 196, 52, 18))
-    D.ellipse(fig, red, (60, 86, 120, 90))
-    D.ellipse(fig, lt, (84, 132, 84, 42))
-    for i in range(5):
-        sx = 76 + i * 18
-        D.polygon(fig, (255, 150, 40), [(sx, 94 - i * 2), (sx + 9, 94 - i * 2), (sx + 4, 74 - i * 2)])
-    D.polygon(fig, red, [(150, 96), (168, 44), (200, 46), (206, 100)])
-    D.polygon(fig, red, [(162, 46), (236, 44), (238, 76), (210, 80), (160, 92)])
-    D.polygon(fig, dk, [(170, 84 + p * 3), (236, 80 + p * 3), (228, 100 + p * 3), (176, 102 + p * 3)])
-    for tx in range(184, 232, 10):
-        D.polygon(fig, (255, 255, 255), [(tx, 78 + p * 2), (tx + 6, 78 + p * 2), (tx + 3, 88 + p * 2)])
-    D.circle(fig, (255, 220, 60), (190, 58), 7)
-    D.circle(fig, (10, 0, 0), (192, 58), 3)
-    D.line(fig, (40, 10, 10), (180, 48), (202, 56), 4)
-    D.line(fig, dk, (150, 112), (172, 130), 8)
-    D.lines(fig, (255, 170, 50), False, [(100, 100), (112, 116), (104, 130)], 3)
-    D.polygon(fig, (255, 140, 40), [(238, 56), (252, 50 + p * 3), (240, 66)])
-
-
-def _c_octopus(fig, p, q):
-    pur, lt = (130, 70, 190), (190, 130, 240)
-    ph = math.atan2(p, q)
-    for i in range(6):
-        bx = 72 + i * 19
-        pts = []
-        for j in range(6):
-            pts.append((bx + math.sin(j * 0.9 + i * 0.7 + ph) * 10 + (i - 2.5) * j * 3, 120 + j * 18))
-        D.lines(fig, pur, False, pts, 12)
-        D.circle(fig, lt, pts[-1], 7)
-    D.circle(fig, pur, (120, 86), 54)
-    D.ellipse(fig, lt, (78, 46, 44, 24))
-    for ex in (102, 138):
-        D.circle(fig, (255, 240, 100), (ex, 92), 14)
-        D.ellipse(fig, (10, 0, 20), (ex - 3, 82, 6, 20))
-    D.line(fig, (50, 20, 90), (88, 76), (112, 84), 4)
-    D.line(fig, (50, 20, 90), (152, 76), (128, 84), 4)
-    for sx, sy in ((84, 108), (156, 106), (120, 52), (100, 58)):
-        D.circle(fig, (120, 255, 220), (sx, sy), 4)
-    D.ellipse(fig, (40, 10, 60), (104, 114, 32, 16))
-    D.polygon(fig, (255, 255, 255), [(108, 114), (113, 114), (110, 122)])
-    D.polygon(fig, (255, 255, 255), [(127, 114), (132, 114), (130, 122)])
-    D.line(fig, pur, (120, 34), (120, 14), 5)
-    D.circle(fig, (120, 255, 200), (120, 12), 7)
-
-
-def _c_skull(fig, p, q):
-    robe, robe2 = (60, 30, 110), (110, 60, 180)
-    ph = math.atan2(p, q)
-    bottom = []
-    for i in range(9):
-        bottom.append((190 - i * 17.5, 208 + math.sin(i * 1.3 + ph) * 8))
-    D.polygon(fig, robe, [(72, 100), (168, 100)] + bottom)
-    D.polygon(fig, robe2, [(96, 120), (144, 120), (156, 200), (84, 200)])
-    D.ellipse(fig, robe, (36, 108 + p * 6, 34, 64))
-    D.ellipse(fig, robe, (170, 108 - p * 6, 34, 64))
-    D.circle(fig, (236, 228, 208), (52, 176 + p * 6), 10)
-    D.circle(fig, (236, 228, 208), (188, 176 - p * 6), 10)
-    img = pygame.transform.smoothscale(SKULL_IMGS[0], (px(116), px(116)))
-    fig.blit(img, (px(62), px(26)))
-
-
-def _c_dragon(fig, p, q):
-    body, dk, lt, fire = (60, 150, 200), (30, 90, 140), (170, 225, 245), (255, 150, 40)
-    fl = p * 34
-    # дальнее крыло
-    D.polygon(fig, dk, [(105, 100), (62, 30 - fl), (24, 50 - fl), (48, 80 - fl * 0.4), (32, 100), (72, 112)])
-    # хвост
-    D.lines(fig, body, False, [(64, 140), (36, 160), (20, 152 + p * 8), (10, 168)], 14)
-    D.polygon(fig, fire, [(4, 158 + p * 8), (24, 168 + p * 8), (8, 186 + p * 8)])
-    # лапы
-    D.line(fig, dk, (100, 170), (96, 198), 8)
-    D.line(fig, dk, (140, 170), (146, 196), 8)
-    # тело и брюхо
-    D.ellipse(fig, body, (56, 100, 130, 80))
-    D.ellipse(fig, lt, (80, 132, 90, 40))
-    for i in range(5):
-        sx = 76 + i * 20
-        D.polygon(fig, fire, [(sx, 104 - i), (sx + 10, 104 - i), (sx + 5, 86 - i)])
-    # шея и голова
-    D.polygon(fig, body, [(150, 104), (170, 62), (198, 66), (186, 116)])
-    D.polygon(fig, body, [(168, 60), (232, 62), (236, 84), (200, 92), (170, 86)])
-    D.polygon(fig, dk, [(176, 84), (234, 84), (224, 98), (184, 96)])
-    for tx in range(190, 228, 10):
-        D.polygon(fig, (255, 255, 255), [(tx, 84), (tx + 6, 84), (tx + 3, 92)])
-    D.polygon(fig, dk, [(172, 60), (160, 34), (192, 54)])
-    D.circle(fig, (255, 220, 60), (198, 70), 7)
-    D.circle(fig, (10, 0, 0), (200, 70), 3)
-    D.line(fig, (20, 40, 60), (188, 60), (208, 68), 4)
-    D.circle(fig, dk, (228, 70), 2)
-    # ближнее крыло
-    wing = [(118, 98), (84, 22 - fl), (38, 38 - fl), (64, 72 - fl * 0.4), (48, 96), (92, 108)]
-    D.polygon(fig, lt, wing)
-    D.polygon(fig, dk, wing, 3)
-
-
-_CREATURES = {"pigeon": _c_pigeon, "cat": _c_cat, "bat": _c_bat, "yeti": _c_yeti, "frog": _c_frog,
-              "robot": _c_robot, "scorpion": _c_scorpion, "dino": _c_dino, "octopus": _c_octopus,
-              "skull": _c_skull, "dragon": _c_dragon}
-
-
-def creature_surf(kind, fr, d):
-    """Кадр секретного босса (240x240); рисуется лицом вправо, влево — зеркалом."""
-    key = ("crt", K, kind, fr, d)
-    fig = SPR.get(key)
-    if fig is None:
-        fig = new_surf(240, 240)
-        p = math.sin(fr * math.pi / 2)
-        q = math.cos(fr * math.pi / 2)
-        _CREATURES[kind](fig, p, q)
-        fig = fast(outlined(fig))
-        if d < 0:
-            fig = pygame.transform.flip(fig, True, False)
-        SPR[key] = fig
-        if len(SPR) > 600:
-            for _ in range(150):
-                SPR.pop(next(iter(SPR)))
-    return fig
 
 
 class SecretBoss(Boss):
@@ -2066,6 +1275,8 @@ class SecretBoss(Boss):
 
     def __init__(self, level):
         Boss.__init__(self, level)
+        # на дальних станциях секретные боссы повторяются, но становятся злее
+        level = min(level, len(SECRET_BOSSES) - 1)
         d = SECRET_BOSSES[level]
         self.name = d["name"]
         self.kind = d["kind"]
@@ -2528,564 +1739,14 @@ ABILITY_TAGS = (("heal", "лечится"), ("dodge", "уклоняется"), (
                 ("acid", "кислота"), ("wind", "2-е дыхание"))
 
 
-def draw_boss_bar(surf, b):
-    w, x0 = 356, GW // 2 - 178
-    tags = list(getattr(b, "tags", None) or [n for k, n in ABILITY_TAGS if k in getattr(b, "flags", ())])
-    rows = [tags[i:i + 3] for i in range(0, len(tags), 3)]
-    plate(surf, (x0 - 12, 2, w + 24, 88 + 16 * max(0, len(rows) - 1)), 165, 14,
-          border=(255, 120, 100, 90))
-    if getattr(b, "secret", False):
-        text(surf, f"СЕКРЕТ: {b.name}", f_mid, (255, 215, 70), (GW // 2, 6), center=True)
-    else:
-        text(surf, f"БОСС: {b.name}", f_mid, (255, 130, 110), (GW // 2, 6), center=True)
-    D.rect(surf, (20, 20, 30), (x0, 34, w, 16), border_radius=8)
-    if b.hp > 0:
-        fw = max(2, int(w * b.hp / b.max_hp))
-        D.rect(surf, (200, 40, 50), (x0, 34, fw, 16), border_radius=8)
-        D.rect(surf, (245, 90, 90), (x0, 34, fw, 8), border_radius=6)
-        D.rect(surf, (255, 170, 160), (x0 + 3, 36, max(1, fw - 6), 2), border_radius=1)
-    for q in (1, 2, 3):
-        D.line(surf, (20, 20, 30), (x0 + w * q // 4, 34), (x0 + w * q // 4, 49), 2)
-    D.rect(surf, (255, 255, 255), (x0, 34, w, 16), 2, border_radius=8)
-    if b.state == "fight":
-        info = f"{int(b.hp)}/{int(b.max_hp)}  •  осталось {int(b.time_left)} с"
-    else:
-        info = "Босс сброшен на пути — жди поезд!"
-    text(surf, info, f_small, (255, 255, 255), (GW // 2, 54), center=True)
-    for i, row in enumerate(rows):
-        text(surf, " • ".join(row), f_small, (150, 235, 110), (GW // 2, 70 + 16 * i),
-             center=True, shadow=False)
-
-
-def train_sprite(body, night, gold):
-    """Корпус поезда рисуется один раз на каждый цвет; по экрану едет готовая картинка."""
-    key = (K, body, night, gold)
-    hit = TRAIN_CACHE.get(key)
-    if hit is not None:
-        return hit
-    h = 110
-    dark = lerp_c(body, (0, 0, 0), 0.35)
-    lite = lerp_c(body, (255, 255, 255), 0.22)
-    stripe = lerp_c(body, (255, 255, 255), 0.45)
-    wc = (255, 226, 140) if night else (170, 214, 245)
-    wc2 = (255, 245, 200) if night else (225, 242, 255)
-    s = new_surf(Train.LENGTH, h + 10)
-    wheels_all = []
-    parts = [(0, 230)] + [(238 + i * 198, 190) for i in range(3)]
-    for idx, (ox, w) in enumerate(parts):
-        r = pygame.Rect(ox, 0, w, h)
-        # подвагонная рама
-        D.rect(s, (24, 24, 30), (r.x + 8, r.y + h - 14, w - 16, 14), border_radius=4)
-        D.rect(s, body, r, border_radius=14 if idx == 0 else 8)
-        D.rect(s, lite, (r.x + 4, r.y + 12, w - 8, 10), border_radius=5)
-        D.rect(s, dark, (r.x, r.y, w, 10), border_radius=6)
-        D.rect(s, dark, (r.x + 2, r.y + h - 24, w - 4, 14), border_radius=5)
-        D.rect(s, stripe, (r.x, r.y + h - 38, w, 8))
-        D.rect(s, lerp_c(body, (0, 0, 0), 0.2), (r.x, r.y + h - 30, w, 2))
-        if idx == 0:
-            for wr in ((r.x + 30, r.y + 22, 70, 38), (r.x + 118, r.y + 22, 50, 38)):
-                D.rect(s, (20, 22, 30), (wr[0] - 3, wr[1] - 3, wr[2] + 6, wr[3] + 6), border_radius=8)
-                D.rect(s, wc, wr, border_radius=6)
-                D.polygon(s, wc2, [(wr[0] + 8, wr[1] + wr[3] - 4), (wr[0] + 22, wr[1] + 4),
-                                   (wr[0] + 32, wr[1] + 4), (wr[0] + 18, wr[1] + wr[3] - 4)])
-        else:
-            for k in range(3):
-                wr = (r.x + 14 + k * 58, r.y + 22, 44, 36)
-                D.rect(s, (20, 22, 30), (wr[0] - 3, wr[1] - 3, wr[2] + 6, wr[3] + 6), border_radius=7)
-                D.rect(s, wc, wr, border_radius=5)
-                D.polygon(s, wc2, [(wr[0] + 5, wr[1] + wr[3] - 3), (wr[0] + 16, wr[1] + 3),
-                                   (wr[0] + 24, wr[1] + 3), (wr[0] + 13, wr[1] + wr[3] - 3)])
-            # дверь
-            dx = r.x + w - 22
-            D.rect(s, dark, (dx, r.y + 18, 14, 54), border_radius=3)
-            D.line(s, lerp_c(dark, (255, 255, 255), 0.3), (dx + 7, r.y + 20), (dx + 7, r.y + 70), 1)
-        # заклёпки
-        for rx in range(r.x + 12, r.x + w - 8, 26):
-            D.circle(s, lerp_c(body, (0, 0, 0), 0.25), (rx, r.y + 6), 2)
-        wheels = [r.x + 28, r.x + w - 28] + ([r.x + w // 2] if idx == 0 else [])
-        for wx in wheels:
-            cy = h - 6
-            D.circle(s, (30, 30, 36), (wx, cy), 12)
-            D.circle(s, (70, 70, 80), (wx, cy), 12, 2)
-            D.circle(s, (120, 120, 130), (wx, cy), 5)
-            wheels_all.append((wx, cy))
-    for ex in (230, 428, 626):
-        D.rect(s, (40, 40, 46), (ex, 88, 10, 8))
-    D.circle(s, (255, 245, 170), (6, 66), 7)
-    D.circle(s, (255, 255, 235), (5, 65), 3)
-    if len(TRAIN_CACHE) > 8:
-        TRAIN_CACHE.clear()
-    hit = (fast(s), wheels_all)
-    TRAIN_CACHE[key] = hit
-    return hit
-
-
-class Train:
-    LENGTH = 824
-
-    def __init__(self, gold=False):
-        self.x = GW + 20
-        self.speed = 1100
-        self.gold = gold
-
-    def rect(self):
-        return pygame.Rect(self.x, TRAIN_Y, self.LENGTH, 110)
-
-    def update(self, dt):
-        self.x -= self.speed * dt
-
-    def done(self):
-        return self.x + self.LENGTH < 0
-
-    def draw(self, surf, col, light):
-        x = int(self.x)
-        y = TRAIN_Y
-        body = (235, 190, 40) if self.gold else col["train"]
-        spr, wheels = train_sprite(body, light > 0.4, self.gold)
-        # прожектор спереди
-        if light > 0.3 or self.gold:
-            HEAD_CONE.set_alpha(int(255 * max(light, 0.6 if self.gold else 0)))
-            surf.blit(HEAD_CONE, (px(x + 6) - HEAD_CONE.get_width(), px(y + 68) - HEAD_CONE.get_height() // 2))
-        # линии скорости позади
-        for k in range(5):
-            ly = y + 16 + k * 20
-            ln = 60 + 26 * ((k * 7) % 4)
-            D.line(surf, lerp_c(col["bed"], (255, 255, 255), 0.35),
-                   (x + self.LENGTH + 6, ly), (x + self.LENGTH + 6 + ln, ly), 2)
-        blit(surf, spr, (x, y))
-        ang = self.x * 0.08
-        for (wx, cy) in wheels:
-            D.line(surf, (170, 170, 180), (x + wx, y + cy),
-                   (x + wx + math.cos(ang) * 10, y + cy + math.sin(ang) * 10), 2)
-        if light > 0.3 or self.gold:
-            glow(surf, (x - 10, y + 66), 110, (255, 240, 170), int(130 * max(light, 0.6 if self.gold else 0)))
-        if self.gold:
-            for k in range(4):                # блестящие искорки на золотом поезде
-                sx = x + 40 + ((pygame.time.get_ticks() // 7 + k * 211) % (self.LENGTH - 80))
-                D.circle(surf, (255, 255, 220), (sx, y + 12 + (k * 23) % 60), 2)
-
-
-class Effect:
-    def __init__(self, x, y, txt, color=(255, 255, 255)):
-        self.x, self.y, self.t, self.txt, self.color = x, y, 0.9, txt, color
-
-    def update(self, dt):
-        self.t -= dt
-
-    def draw(self, surf):
-        age = 0.9 - self.t
-        img = _text_img(self.txt, f_mid, self.color, True).copy()
-        img.set_alpha(255 if self.t > 0.3 else max(0, int(255 * self.t / 0.3)))
-        o = _ol()
-        bw = img.get_width() - 2 * o
-        surf.blit(img, (px(self.x) - bw // 2 - o, px(self.y - 110 - age * 50) - o))
-
-
-class Particle:
-    def __init__(self, x, y, color):
-        a = random.uniform(0, math.tau)
-        sp = random.uniform(80, 260)
-        self.x, self.y = x, y
-        self.vx, self.vy = math.cos(a) * sp, math.sin(a) * sp - 150
-        self.life = self.max = random.uniform(0.5, 1.0)
-        self.color = color
-        self.size = random.randint(3, 6)
-
-    def update(self, dt):
-        self.x += self.vx * dt
-        self.y += self.vy * dt
-        self.vy += 600 * dt
-        self.life -= dt
-
-    def draw(self, surf):
-        r = max(1, int(self.size * self.life / self.max))
-        D.circle(surf, self.color, (int(self.x), int(self.y)), r)
-        if r > 2:
-            D.circle(surf, lerp_c(self.color, (255, 255, 255), 0.5),
-                               (int(self.x) - 1, int(self.y) - 1), max(1, r // 2))
-
-
-class Coin:
-    """Золотая монета падает с неба и подпрыгивает на платформе — кликни, пока не исчезла."""
-
-    def __init__(self):
-        self.x = random.uniform(90, GW - 90)
-        self.y = -20.0
-        self.vy = 0.0
-        self.t = 8.0
-        self.floor = random.uniform(PLAT_TOP + 20, PLAT_TOP + 55)
-        self.spin = random.uniform(0, 6)
-
-    def update(self, dt):
-        self.t -= dt
-        self.spin += dt * 6
-        self.vy += 900 * dt
-        self.y += self.vy * dt
-        if self.y >= self.floor:
-            self.y = self.floor
-            self.vy = -self.vy * 0.55 if abs(self.vy) > 140 else 0.0
-
-    def draw(self, surf):
-        if self.t < 2.0 and int(self.t * 8) % 2 == 0:
-            return                              # мигает перед исчезновением
-        x, y = int(self.x), int(self.y)
-        wob = abs(math.cos(self.spin))          # монета вращается
-        rw = max(3, int(17 * (0.35 + 0.65 * wob)))
-        glow(surf, (x, y), 52, (255, 215, 60), 110)
-        D.ellipse(surf, (200, 150, 20), (x - rw - 1, y - 18, rw * 2 + 2, 36))
-        D.ellipse(surf, (255, 205, 40), (x - rw, y - 17, rw * 2, 34))
-        D.ellipse(surf, (255, 240, 150), (x - rw + 3, y - 13, max(2, rw - 2), 12))
-        if wob > 0.6:
-            text(surf, "$", f_mid, (160, 105, 10), (x, y - 11), center=True, shadow=False)
-
-
-# ---------- кровь, череп и кислота ----------
-class Decal:
-    """Пятно крови на путях: остаётся на несколько секунд и медленно тает."""
-
-    def __init__(self, x, y, big=False):
-        self.max = self.t = random.uniform(6.0, 10.0)
-        w = random.randint(36, 62) if big else random.randint(22, 42)
-        h = max(8, int(w * 0.45))
-        s = new_surf(w, h)
-        for _ in range(random.randint(4, 7)):
-            rw = random.randint(max(6, w // 3), max(7, w * 2 // 3))
-            rh = random.randint(max(4, h // 3), max(5, h * 2 // 3))
-            D.ellipse(s, (135 + random.randint(0, 45), 12, 16, random.randint(130, 205)),
-                      (random.randint(0, max(0, w - rw)), random.randint(0, max(0, h - rh)), rw, rh))
-        for _ in range(4):                      # брызги вокруг пятна
-            D.circle(s, (120, 10, 14, random.randint(80, 150)),
-                     (random.randint(1, w - 2), random.randint(1, h - 2)),
-                     random.randint(2, 5))
-        self.surf = fast(s)
-        self.x, self.y = x - w // 2, y - h // 2
-
-    def update(self, dt):
-        self.t -= dt
-
-    def draw(self, surf):
-        k = max(0.0, self.t / self.max)
-        self.surf.set_alpha(255 if k > 0.35 else int(255 * k / 0.35))
-        surf.blit(self.surf, (px(self.x), px(self.y)))
-
-
-def make_skull(jaw=0):
-    """Череп с запасом по разрешению (576 px): он летит в камеру и растягивается на весь экран.
-    Объёмная кость с градиентом, трещины, злые пылающие глаза, клыки и челюсть, которая щёлкает."""
-    S = 6
-    s = pygame.Surface((96 * S, 96 * S), pygame.SRCALPHA)
-    dr = pygame.draw
-
-    def R(x, y, w, h):
-        return (int(x * S), int(y * S), int(w * S), int(h * S))
-
-    def P(*pts):
-        return [(int(x * S), int(y * S)) for x, y in pts]
-
-    bone = (238, 230, 210)
-    mid = (208, 198, 172)
-    shade = (152, 140, 118)
-    deep = (92, 82, 70)
-    hi = (255, 252, 240)
-    black = (8, 6, 10)
-    jy = 9 * jaw                       # на сколько опущена челюсть
-
-    # --- нижняя челюсть (рисуется первой, она позади черепа) ---
-    dr.rect(s, shade, R(24, 70 + jy, 48, 19), border_radius=9 * S)
-    dr.rect(s, bone, R(25, 70 + jy, 46, 16), border_radius=8 * S)
-    dr.rect(s, mid, R(25, 79 + jy, 46, 7), border_radius=6 * S)
-    dr.line(s, deep, (48 * S, 79 * S + jy * S), (48 * S, 87 * S + jy * S), S)    # шов подбородка
-    # тёмный рот
-    dr.rect(s, black, R(26, 62, 44, 12 + jy), border_radius=4 * S)
-    # нижние зубы
-    for i in range(8):
-        tx = 28.5 + i * 5.2
-        dr.rect(s, hi, R(tx, 69 + jy, 4, 7), border_radius=S)
-        dr.rect(s, shade, R(tx, 69 + jy, 4, 7), max(1, S // 3), border_radius=S)
-
-    # --- череп: объём из слоёв, свет сверху-слева ---
-    dr.ellipse(s, deep, R(9, 2, 78, 68))
-    dr.ellipse(s, shade, R(11, 3, 74, 65))
-    layers = 9
-    for i in range(layers):
-        k = i / (layers - 1)
-        c = lerp_c(mid, hi, k)
-        dr.ellipse(s, c, R(12 + i * 1.3, 4 + i * 1.0, 72 - i * 3.4, 60 - i * 3.2))
-    # скулы и верхняя челюсть
-    dr.rect(s, shade, R(21, 47, 54, 24), border_radius=10 * S)
-    dr.rect(s, bone, R(22, 47, 52, 22), border_radius=9 * S)
-    for cx_ in (12, 66):
-        dr.ellipse(s, shade, R(cx_, 38, 19, 20))
-        dr.ellipse(s, bone, R(cx_ + 1, 38, 17, 18))
-        dr.ellipse(s, hi, R(cx_ + 3, 40, 7, 6))
-
-    # --- шов на лбу и трещины ---
-    dr.lines(s, deep, False, P((49, 6), (46, 12), (51, 18), (47, 25)), int(S * 1.2))
-    dr.lines(s, deep, False, P((64, 7), (60, 14), (66, 21), (61, 30), (63, 36)), int(S * 1.6))
-    dr.lines(s, deep, False, P((60, 14), (54, 17)), S)
-    dr.lines(s, deep, False, P((24, 13), (29, 20), (26, 26)), S)
-
-    # --- глазницы: злые, скошенные внутрь ---
-    left = [(16, 31), (31, 26), (46, 37), (43, 52), (28, 55), (17, 46)]
-    right = [(96 - x, y) for x, y in left]
-    for pts in (left, right):
-        dr.polygon(s, deep, P(*pts))
-        inner = [((x - 48) * 0.88 + 48 if x < 48 else (x - 48) * 0.88 + 48, y) for x, y in pts]
-        dr.polygon(s, black, P(*inner))
-    # пылающие зрачки
-    for ex in (31, 65):
-        dr.circle(s, (90, 6, 6), (ex * S, 42 * S), 9 * S)
-        dr.circle(s, (200, 24, 14), (ex * S, 42 * S), 6.5 * S)
-        dr.circle(s, (255, 110, 30), (ex * S, 42 * S), 4.2 * S)
-        dr.circle(s, (255, 225, 120), (ex * S, 41 * S), 2 * S)
-    # тяжёлые брови над глазницами
-    dr.line(s, deep, (14 * S, 29 * S), (46 * S, 37 * S), int(S * 2.2))
-    dr.line(s, deep, (82 * S, 29 * S), (50 * S, 37 * S), int(S * 2.2))
-
-    # --- нос: перевёрнутое сердечко ---
-    dr.polygon(s, black, P((48, 51), (42, 61), (45, 66), (48, 62), (51, 66), (54, 61)))
-
-    # --- верхние зубы и клыки ---
-    for i in range(8):
-        tx = 28.5 + i * 5.2
-        dr.rect(s, hi, R(tx, 61, 4, 9), border_radius=S)
-        dr.rect(s, shade, R(tx, 61, 4, 9), max(1, S // 3), border_radius=S)
-    for fx in (30.5, 65.5):            # клыки
-        dr.polygon(s, hi, P((fx - 2.5, 62), (fx + 2.5, 62), (fx, 74 + jy * 0.5)))
-        dr.polygon(s, shade, P((fx - 2.5, 62), (fx + 2.5, 62), (fx, 74 + jy * 0.5)), max(1, S // 3))
-
-    # тёмная кромка, чтобы череп «держал» объём
-    dr.ellipse(s, deep, R(9, 2, 78, 68), S)
-    return fast(outlined(s, (6, 4, 8), o=S))
-
-
-class SkullFly:
-    """Череп летит в камеру: от маленькой точки до всего экрана, щёлкает челюстью."""
-
-    def __init__(self, x, y):
-        self.x, self.y = float(x), float(y)
-        self.t = 0.0
-        self.dur = 1.1
-        self.rot = 0.0
-        self.spin = random.uniform(-220, 220)
-
-    def update(self, dt):
-        self.t += dt
-        # вращение гасится, чтобы к концу череп смотрел «в лицо»
-        self.rot += self.spin * dt * max(0.0, 1.0 - self.t / self.dur)
-
-    def draw(self, surf):
-        k = min(1.0, self.t / self.dur)
-        size = max(8, int(96 * (0.4 + 4.6 * k * k)))
-        base = SKULL_IMGS[int(self.t * 16) % 2]
-        spx = max(8, px(size))
-        img = pygame.transform.smoothscale(base, (spx, spx))
-        if k > 0.8:
-            img.set_alpha(max(0, int(255 * (1 - (k - 0.8) / 0.2))))
-        if abs(self.rot) > 1:
-            img = pygame.transform.rotate(img, self.rot)
-        cx = lerp(self.x, W * 0.5, k)
-        cy = lerp(self.y, H * 0.48, k)
-        # дрожь, нарастающая к концу
-        if k > 0.3:
-            amp = int(2 + 8 * k)
-            cx += random.randint(-amp, amp)
-            cy += random.randint(-amp, amp)
-        if 0.45 < k < 1.0:                     # красная вспышка по всему экрану
-            fa = int(110 * math.sin((k - 0.45) / 0.55 * math.pi))
-            if fa > 0:
-                RED_FLASH.set_alpha(fa)
-                surf.blit(RED_FLASH, (0, 0))
-        pulse = 0.5 + 0.5 * math.sin(self.t * 30)
-        glow(surf, (cx, cy), min(size * 0.95, 280), (255, 30, 30), int(60 + 40 * pulse) // 20 * 20)
-        blit_c(surf, img, cx, cy)
-
-
-class Acid:
-    """Плевок босса летит по дуге в камеру и заливает экран зелёным."""
-
-    def __init__(self, x, y):
-        self.x0, self.y0 = float(x), float(y)
-        self.tx = random.uniform(W * 0.28, W * 0.78)
-        self.ty = random.uniform(H * 0.35, H * 0.72)
-        self.t = 0.0
-        self.dur = random.uniform(1.0, 1.35)
-        self.done = False
-
-    def update(self, dt):
-        self.t = min(self.dur, self.t + dt)
-        if self.t >= self.dur:
-            self.done = True
-
-    def _pt(self, k):
-        return (lerp(self.x0, self.tx, k),
-                lerp(self.y0, self.ty, k) - math.sin(k * math.pi) * 150)
-
-    def draw(self, surf):
-        k = self.t / self.dur
-        x, y = self._pt(k)
-        r = 10 + 18 * k
-        glow(surf, (x, y), r * 2.6, (120, 255, 60), 80)
-        for i in range(4):                     # шлейф из капель
-            tx, ty = self._pt(max(0.0, k - 0.06 * (i + 1)))
-            D.circle(surf, (150 - i * 22, 240 - i * 34, 44),
-                               (int(tx), int(ty)), max(2, int(r * (1 - 0.2 * i))))
-        D.circle(surf, (210, 255, 130), (int(x), int(y)), max(3, int(r * 0.55)))
-
-
-def make_acid_overlay():
-    """Кислота на «стекле» камеры: капли и потёки поверх всего экрана."""
-    s = new_surf(W, H)
-    for _ in range(random.randint(7, 10)):
-        r = random.randint(80, 210)
-        x, y = random.randint(-30, W - 30), random.randint(-30, H - 30)
-        D.circle(s, (66, 185, 38, 150), (x, y), r)
-        D.circle(s, (120, 225, 66, 110), (x - r // 4, y - r // 4), max(6, r * 2 // 3))
-        D.circle(s, (185, 250, 120, 70), (x - r // 3, y - r // 3), max(4, r // 3))
-        for _ in range(6):
-            D.circle(s, (90, 210, 50, random.randint(70, 145)),
-                     (x + random.randint(-r, r), y + random.randint(-r, r)),
-                     random.randint(3, 13))
-        # потёк вниз
-        fx = x + random.randint(-r // 2, r // 2)
-        fh = random.randint(40, 150)
-        D.rect(s, (86, 205, 46, 130), (fx, y, random.randint(6, 14), fh), border_radius=6)
-    return fast(s)
 
 
 # ---------- интерфейс ----------
 
-def build_panel_bg():
-    base = pygame.Surface((PWP, HP))
-    vband(base, 0, PW, 0, H, (40, 43, 62), (16, 18, 28))
-    # едва заметная диагональная текстура
-    tex = pygame.Surface((PWP, HP))
-    for i in range(-H, PW, 22):
-        D.line(tex, (255, 255, 255), (i, 0), (i + H, H), 1)
-    tex.set_alpha(9)
-    base.blit(tex, (0, 0))
-    # шапка
-    vband(base, 0, PW, 0, 34, (62, 68, 104), (40, 43, 62))
-    return fast(base, False)
+# палитра живёт в taran/ui/theme.py и импортирована звёздочкой выше:
+# game.UI_GOLD, game.UI_LINE и остальные имена работают как раньше
 
 
-def card(surf, r, base, border, accent=None):
-    D.rect(surf, (8, 9, 16), r.move(0, 3), border_radius=10)
-    D.rect(surf, base, r, border_radius=10)
-    D.line(surf, lerp_c(base, (255, 255, 255), 0.14), (r.x + 10, r.y + 2), (r.right - 10, r.y + 2), 1)
-    D.rect(surf, border, r, 2, border_radius=10)
-    if accent:
-        D.rect(surf, accent, (r.x + 3, r.y + 10, 4, r.h - 20), border_radius=2)
-
-
-def draw_panel(surf, s, mouse, tab):
-    now = pygame.time.get_ticks() / 1000.0
-    pulse = 0.5 + 0.5 * math.sin(now * 4)
-    inf = inflation(s)
-    upf = up_infl(s)
-    surf.blit(PANEL_BG, (GWP, 0))
-    D.line(surf, (90, 96, 130), (GW, 0), (GW, H), 2)
-    D.line(surf, (20, 22, 34), (GW + 2, 0), (GW + 2, H), 2)
-    text(surf, "Магазин", f_mid, (255, 255, 255), (GW + 16, 8), shadow=False)
-    lab = f"Инфляция x{fmt(int(inf))}"
-    text(surf, lab, f_small, (255, 214, 90),
-         (GW + PW - 12 - twidth(f_small, lab), 11), shadow=False)
-
-    # вкладки
-    for t in range(len(TAB_NAMES)):
-        r = pygame.Rect(GW + 10 + t * TAB_GAP, TAB_Y, TAB_W, 26)
-        active = (t == tab)
-        D.rect(surf, (70, 90, 150) if active else (44, 47, 66), r, border_radius=8)
-        if active:
-            D.rect(surf, (96, 120, 190), (r.x + 3, r.y + 2, r.w - 6, 8), border_radius=6)
-        D.rect(surf, (140, 160, 230) if active else (70, 74, 98), r, 2, border_radius=8)
-        text(surf, TAB_NAMES[t], f_small, (255, 255, 255) if active else (170, 176, 205),
-             (r.centerx, r.y + 5), center=True, shadow=False)
-        ready = False
-        if t == ITEM_TAB:
-            ready = any(s["money"] >= item_price(it, s) for it in ITEMS)
-        else:
-            for gi in tab_items(t):
-                u = UPGRADES[gi]
-                lvl = s["levels"][u["key"]]
-                if s["level"] >= u["req"] and lvl < u["max"] and s["money"] >= cost(u, lvl, upf):
-                    ready = True
-                    break
-        if ready and not active:      # жёлтая точка — есть что купить
-            glow(surf, (r.right - 8, r.y + 8), 9, (255, 200, 60), 150)
-            D.circle(surf, (255, 200, 60), (r.right - 8, r.y + 8), 4)
-
-    for k, gi in enumerate(tab_items(tab)):
-        u = UPGRADES[gi]
-        lvl = s["levels"][u["key"]]
-        r = pygame.Rect(GW + 10, ROW_Y0 + k * ROW_H, PW - 20, ROW_H - 8)
-        locked = s["level"] < u["req"]
-        if locked:
-            card(surf, r, (32, 34, 48), (54, 57, 78))
-            text(surf, f"{k + 1}. {u['name']}", f_mid, (120, 124, 146), (r.x + 10, r.y + 6), shadow=False)
-            text(surf, f"Откроется на уровне {u['req'] + 1}", f_small, (150, 154, 178),
-                 (r.x + 10, r.y + 36), shadow=False)
-            # замок
-            lx, ly = r.right - 26, r.y + 30
-            D.rect(surf, (110, 114, 140), (lx, ly, 16, 13), border_radius=3)
-            D.arc(surf, (110, 114, 140), (lx + 2, ly - 9, 12, 14), 0, math.pi, 2)
-            continue
-        maxed = lvl >= u["max"]
-        c = cost(u, lvl, upf)
-        can = (not maxed) and s["money"] >= c
-        bg = (44, 100, 64) if can else (48, 51, 70)
-        if maxed:
-            bg = (60, 56, 40)
-        if can and r.collidepoint(mouse):
-            bg = (62, 130, 86)
-        border = lerp_c((96, 160, 112), (170, 240, 150), pulse) if can else ((130, 112, 56) if maxed else (70, 74, 98))
-        card(surf, r, bg, border, (110, 220, 140) if can else ((240, 200, 80) if maxed else None))
-        text(surf, f"{k + 1}. {u['name']}", f_mid, (255, 255, 255), (r.x + 12, r.y + 6), shadow=False)
-        lvs = f"Ур. {lvl}/{u['max']}"
-        text(surf, lvs, f_small, (190, 196, 224), (r.right - twidth(f_small, lvs) - 10, r.y + 9), shadow=False)
-        line = f"{u['label']}: {u['v'](lvl)}" + ("" if maxed else f" → {u['v'](lvl + 1)}")
-        text(surf, line, f_small, (210, 215, 235), (r.x + 12, r.y + 30), shadow=False)
-        price = "МАКС" if maxed else f"${fmt(c)}"
-        pcol = (255, 226, 90) if (can or maxed) else (150, 152, 170)
-        text(surf, price, f_mid, pcol, (r.x + 12, r.y + 42), shadow=False)
-        bx, bw = r.x + 110, r.w - 122
-        D.rect(surf, (22, 24, 36), (bx, r.y + 54, bw, 8), border_radius=4)
-        if lvl > 0:
-            fw = max(4, int(bw * lvl / u["max"]))
-            D.rect(surf, (96, 190, 120), (bx, r.y + 54, fw, 8), border_radius=4)
-            D.rect(surf, (170, 240, 190), (bx + 2, r.y + 55, max(1, fw - 4), 2), border_radius=1)
-        D.rect(surf, (60, 64, 88), (bx, r.y + 54, bw, 8), 1, border_radius=4)
-    # вкладка «Зелья»: строка — применить, кнопка справа — купить
-    if tab == ITEM_TAB:
-        for k, it in enumerate(ITEMS):
-            r = pygame.Rect(GW + 10, ROW_Y0 + k * ROW_H, PW - 20, ROW_H - 8)
-            cnt = s["items"].get(it["key"], 0)
-            p = item_price(it, s)
-            can = s["money"] >= p
-            bg = (44, 100, 64) if cnt > 0 else (48, 51, 70)
-            if r.collidepoint(mouse):
-                bg = (62, 130, 86) if cnt > 0 else (58, 62, 84)
-            card(surf, r, bg, (96, 160, 112) if cnt > 0 else (70, 74, 98),
-                 (110, 220, 140) if cnt > 0 else None)
-            text(surf, f"{k + 1}. {it['name']}", f_mid, (255, 255, 255), (r.x + 12, r.y + 6),
-                 shadow=False)
-            bs_ = f"x{cnt}"
-            text(surf, bs_, f_small, (255, 226, 90) if cnt else (150, 152, 170),
-                 (r.right - twidth(f_small, bs_) - 12, r.y + 9), shadow=False)
-            text(surf, it["desc"], f_small, (210, 215, 235), (r.x + 12, r.y + 32), shadow=False)
-            br = item_buy_rect(k)
-            D.rect(surf, (78, 96, 150) if can else (44, 47, 64), br, border_radius=8)
-            if can:
-                D.rect(surf, (104, 124, 184), (br.x + 3, br.y + 2, br.w - 6, 8), border_radius=6)
-            D.rect(surf, (140, 165, 225) if can else (70, 74, 98), br, 2, border_radius=8)
-            text(surf, f"${fmt(p)}", f_small,
-                 (255, 255, 255) if can else (140, 144, 168),
-                 (br.centerx, br.y + 5), center=True, shadow=False)
-        text(surf, "Клик по строке — применить", f_small, (130, 136, 165),
-             (GW + 16, H - 66), shadow=False)
-    text(surf, "1–8 — купить/применить  •  Tab — вкладка", f_small, (130, 136, 165),
-         (GW + 16, H - 42), shadow=False)
-    text(surf, "Прогресс сохраняется сам", f_small, (130, 136, 165), (GW + 16, H - 24), shadow=False)
 
 
 # ---------- ресурсы, зависящие от разрешения ----------
@@ -3103,11 +1764,14 @@ def build_assets():
     pd.fill((2, 4, 14))
     PAUSE_DIM = fast(pd, False)
     PAUSE_DIM.set_alpha(165)
-    for c in (_TC, _GC, _PC, SPR, TRAIN_CACHE):
+    for c in (_TC, _GC, _PC, _HEART, SPR, TRAIN_CACHE, _TWC):
         c.clear()
+    _PULSE["key"] = None
+    _PRESENT["size"] = None
+    _PRESENT["surf"] = None
     _GB[0] = 0
     VIGNETTE = make_vignette()
-    LAMP_CONE = make_cone(230, 170, True, 85)
+    LAMP_CONE = make_cone(250, 190, True, 56)
     HEAD_CONE = make_cone(300, 120, False, 120)
     SHADOW_S = make_shadow(False)
     SHADOW_B = make_shadow(True)
@@ -3123,8 +1787,6 @@ def build_assets():
 
 build_assets()
 
-RUSH_DUR = 15.0          # «Час пик»: толпа и доход удваиваются
-COMBO_MILESTONES = (10, 25, 50, 100, 200)
 
 # ---------- заставка: оригинальное видео и титры «Режиссёр Айс» ----------
 # В самом начале игры (и после полного сброса прогресса) проигрывается
@@ -3236,6 +1898,8 @@ def run_intro():
     """Заставка перед геймплеем: оригинальное видео с кроликом (или запасная
     анимация), затем титры «Режиссёр Айс». Пропуск — любая клавиша или клик."""
     global win, INTRO_FRAME_CACHE
+    SND.play("whoosh", 0.5)
+    SND.play_music("intro", fade=1200)
     state = {"black": None, "vid_idx": -1, "vid_cur": None}
     fonts = {}
 
@@ -3400,10 +2064,7 @@ def run_intro():
         ox, oy = (ww - dw) // 2, (wh - dh) // 2
         if not SCALED_OK:
             win.fill((0, 0, 0))
-            if (dw, dh) == (WP, HP):
-                win.blit(canvas_buf, (ox, oy))
-            else:
-                win.blit(pygame.transform.smoothscale(canvas_buf, (dw, dh)), (ox, oy))
+            present(canvas_buf, win, ox, oy, dw, dh)
         pygame.display.flip()
 
     INTRO_FRAME_CACHE = None          # кадры видео не держим в памяти после заставки
@@ -3411,28 +2072,52 @@ def run_intro():
 
 def main():
     global win, fullscreen
+    web_boot_done()                 # экран загрузки в браузере/APK можно убирать
     run_intro()                     # заставка: видео и титры «Режиссёр Айс»
     s = load_save()
+    P.ensure(s)
+    off_gain, off_dt = P.catch_up(s)
+    SND.set_muted(s.get("muted", False))
+    SND.start_music()
     world = World()
     st = s["level"]
-    g = dict(people=[], effects=[], particles=[], rings=[], train=None, spawn=0.5, next_train=4.0,
+    g = dict(people=[], effects=[], particles=[], rings=[], taps=[], train=None, spawn=0.5, next_train=4.0,
              warn=0.0, combo=0, combo_t=0.0, helper_t=0.0, shake=0.0,
+             revived=False,
              stage=st, prev=st, trans=1.0, toast="", toast_t=0.0, toast_col=(255, 235, 120),
+             banner="", banner_sub="", banner_t=0.0, banner_dur=4.2,
              boss=None, boss_cd=0.0, tab=0, idle=0.0, bot_t=0.0,
              fx={k: 0.0 for k in FX_LABELS}, acid=0.0, splats=None,
              acids=[], skulls=[], decals=[],
-             lives=HARD_LIVES, hard_t=0.0, life_flash=0.0,
+             lives=P.start_lives(s), hard_t=0.0, life_flash=0.0,
              coins=[], coin_t=random.uniform(12, 22), rush=0.0, rush_t=random.uniform(45, 75),
              coins_got=0, paused=False, confirm_until=0,
+             depot=False, depot_tab=0, depot_confirm=0,
+             earn_acc=0.0, rate_t=0.0, rate_show=float(P.ensure(s).get("income_rate", 0.0)),
+             autobuy_t=0.0, autopush_t=0.0,
              secret_t=random.uniform(50, 100))
-    save_t = 5.0
+    save_t = 12.0               # реже пишем в localStorage: это заметно на телефоне
+
+    if off_gain > 0:
+        hrs = off_dt / 3600.0
+        g["toast"] = f"ОФЛАЙН: +${fmt(off_gain)} за {hrs:.1f} ч"
+        g["toast_col"] = (255, 224, 120)
+        g["toast_t"] = 6.0
+    elif P.has_pending_relic(s):
+        g["toast"] = "Выберите реликвию в Депо (P)"
+        g["toast_col"] = (255, 214, 110)
+        g["toast_t"] = 5.0
+    elif P.can_rebirth(s):
+        g["toast"] = "Перерождение доступно: Депо (P)"
+        g["toast_col"] = (255, 214, 110)
+        g["toast_t"] = 4.0
 
     def lv(k):
         return s["levels"][k]
 
     def scale_boss(b):
-        """HP босса умножается на коэффициент от урона за клик (см. boss_dmg_scale)."""
-        f = boss_dmg_scale(lv("smash"))
+        """HP босса умножается на коэффициент от урона за клик и модификатор рейса."""
+        f = boss_dmg_scale(lv("smash")) * P.boss_hp_mult(s)
         b.max_hp *= f
         b.hp = b.max_hp
 
@@ -3440,9 +2125,12 @@ def main():
         """Весь заработок копится и в s["earned"] — от него считается инфляция."""
         s["money"] += n
         s["earned"] += n
+        g["earn_acc"] += n
+        P.track(s, "earn", n)
 
     def lose_lives(xs):
         """Хардкор: каждый ушедший с платформы — минус жизнь; ноль жизней — новый забег."""
+        SND.play("life", 0.8)
         for x in xs:
             g["lives"] -= 1
             g["life_flash"] = 0.5
@@ -3450,8 +2138,19 @@ def main():
             g["effects"].append(Effect(max(60, min(GW - 60, x)), PLAT_TOP,
                                        "-1 ЖИЗНЬ", (255, 80, 70)))
             if g["lives"] <= 0:
+                # «Второе дыхание» из Депо: раз за рейс забег не сбрасывается
+                if not g.get("revived") and P.revive_charges(s) > 0:
+                    g["revived"] = True
+                    g["lives"] = 1
+                    g["life_flash"] = 1.0
+                    g["effects"].append(Effect(GW // 2, PLAT_TOP - 40,
+                                               "ВТОРОЕ ДЫХАНИЕ!", (150, 230, 255)))
+                    g["toast"] = "ВТОРОЕ ДЫХАНИЕ! Жизни восстановлены"
+                    g["toast_col"] = (150, 230, 255)
+                    g["toast_t"] = 2.5
+                    return
                 t = g["hard_t"]
-                g["lives"] = HARD_LIVES
+                g["lives"] = P.start_lives(s)
                 g["hard_t"] = 0.0
                 g["combo"] = 0
                 g["combo_t"] = 0.0
@@ -3474,7 +2173,7 @@ def main():
                 return                    # остальные ушедшие этого кадра уже не считаются
 
     def income_mult():
-        m = 1 + 0.15 * lv("mult")
+        m = (1 + 0.15 * lv("mult")) * P.income_mult(s)
         if g["fx"]["p_money"] > 0:
             m *= 2
         if g["rush"] > 0:
@@ -3483,7 +2182,7 @@ def main():
 
     def push_radius():
         """Радиус толчка (зелье «Супер-толчок» его удваивает)."""
-        r = lv("power") * 35
+        r = lv("power") * 35 + P.click_radius_bonus(s)
         r = r * 2 if g["fx"]["p_power"] > 0 else r
         bsr = g["boss"]
         if bsr is not None and getattr(bsr, "slime", False) and bsr.state == "fight" and bsr.fakes:
@@ -3531,15 +2230,15 @@ def main():
                     for _ in range(14):
                         g["particles"].append(Particle(fk.x, fk.y - 40, (110, 230, 120)))
         if bs.rect().inflate(rad, rad).collidepoint(mx, my):
-            dmg = 1 + 2 * lv("smash")
-            crit = random.random() < 0.05 * lv("crit")
+            dmg = P.click_damage(s, bs)
+            crit = random.random() < P.crit_chance(s)
             if crit:
-                dmg *= 3
+                dmg = int(dmg * P.crit_mult(s))
             smash(bs, dmg, mx, my, crit)
 
     def spawn_slime():
         sb = SlimeBoss(s["level"])
-        sb.time_left += 5 * lv("timebonus")
+        sb.time_left += 5 * lv("timebonus") + P.boss_time_bonus(s)
         scale_boss(sb)
         g["boss"] = sb
         g["toast"] = "СЕКРЕТНЫЙ БОСС: Слизень!"
@@ -3558,10 +2257,13 @@ def main():
         res = bs.hit(dmg)
         if res == "dodge":
             g["effects"].append(Effect(x, bs.y - 60, "УВЕРНУЛСЯ!", (200, 200, 255)))
+            SND.play("whoosh", 0.5)
         elif res == "block":
             g["effects"].append(Effect(x, bs.y - 60, "БЛОК!", (120, 190, 255)))
+            SND.play("hit", 0.55)
         elif res == "ok":
             dmg = bs.last_dmg
+            SND.play("crit" if crit else "hit", 0.85 if crit else 0.65)
             g["effects"].append(Effect(x, bs.y - 60, f"КРИТ! -{dmg}" if crit else f"-{dmg}",
                                        (255, 200, 60) if crit else (255, 120, 100)))
             for _ in range(5 if not crit else 12):
@@ -3579,6 +2281,7 @@ def main():
     def explode(b):
         """Бомба-пассажир рвётся: сбивает всех рядом, цепная реакция, урон боссу."""
         g["shake"] = max(g["shake"], 0.55)
+        SND.play("boom", 0.9)
         g["effects"].append(Effect(b.x, b.y - 20, "БУМ!", (255, 160, 60)))
         for _ in range(45):
             g["particles"].append(Particle(b.x, b.y - 40, random.choice(
@@ -3596,8 +2299,10 @@ def main():
             g["effects"].append(Effect(b.x, b.y - 70, f"ЦЕПНАЯ РЕАКЦИЯ x{hit}!", (255, 210, 90)))
 
     def collect_coin(c):
-        reward = round(10 * 1.35 ** lv("income") * 12 * income_mult())
+        reward = round(10 * 1.35 ** lv("income") * 12 * income_mult() * P.coin_mult(s))
         earn(reward)
+        P.on_coin(s)
+        SND.play("coin", 0.85)
         g["coins_got"] += 1
         g["effects"].append(Effect(c.x, c.y, f"МОНЕТА! +${fmt(reward)}", (255, 225, 60)))
         for _ in range(22):
@@ -3618,13 +2323,16 @@ def main():
         fresh = new_save()
         s.clear()
         s.update(fresh)
-        for k in ("people", "effects", "particles", "rings", "acids", "skulls", "decals", "coins"):
+        for k in ("people", "effects", "particles", "rings", "taps", "acids", "skulls",
+                  "decals", "coins"):
             g[k] = []
         g.update(train=None, spawn=0.5, next_train=4.0, warn=0.0, combo=0, combo_t=0.0,
+                 revived=False,
                  helper_t=0.0, shake=0.0, stage=0, prev=0, trans=1.0, boss=None, boss_cd=0.0,
                  idle=0.0, bot_t=0.0, acid=0.0, splats=None, lives=HARD_LIVES, hard_t=0.0,
                  life_flash=0.0, rush=0.0, rush_t=random.uniform(45, 75),
                  coin_t=random.uniform(12, 22), coins_got=0, confirm_until=0,
+                 banner="", banner_sub="", banner_t=0.0,
                  secret_t=random.uniform(50, 100))
         for k in g["fx"]:
             g["fx"][k] = 0.0
@@ -3638,6 +2346,7 @@ def main():
         for i, r in enumerate(pause_rects()):
             if not r.collidepoint(mx, my):
                 continue
+            SND.play("click", 0.7)
             if i == 0:
                 g["paused"] = False
             elif i == 1:
@@ -3680,11 +2389,26 @@ def main():
                     if set_fullscreen(not fullscreen):
                         after_scale()
                 elif e.key == pygame.K_ESCAPE:          # Esc — пауза / продолжить
-                    g["paused"] = not g["paused"]
+                    if g["depot"]:
+                        g["depot"] = False
+                    else:
+                        g["paused"] = not g["paused"]
                     g["confirm_until"] = 0
+                    SND.play("click", 0.7)
+                elif e.key == pygame.K_p:               # P — Депо (мета-прогрессия)
+                    g["depot"] = not g["depot"]
+                    g["depot_confirm"] = 0
+                    SND.play("click", 0.75)
+                elif e.key == pygame.K_m:               # M — звук вкл/выкл
+                    s["muted"] = SND.toggle()
+                    write_save(s)
                 elif e.key == pygame.K_F10:         # качество картинки: 1x → 1.5x → 2x
                     change_scale(next((q for q in QUALITY if q > K + 1e-6), QUALITY[0]))
                     after_scale()
+                elif g["depot"]:
+                    if 0 <= idx < 4:                # 1–4 — вкладки Депо
+                        g["depot_tab"] = idx
+                        SND.play("click", 0.6)
                 elif g["paused"]:
                     pass                                # на паузе игровые клавиши не работают
                 elif e.key == pygame.K_TAB:
@@ -3698,32 +2422,62 @@ def main():
                 win = pygame.display.set_mode((max(320, e.w), max(180, e.h)), pygame.RESIZABLE)
             elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 mx, my = mp(e.pos)
-                if g["paused"]:
+                if g["depot"]:
+                    UI.depot_click(s, g, mx, my)
+                elif not g["paused"] and UI.depot_hit(mx, my):
+                    g["depot"] = True
+                    g["depot_confirm"] = 0
+                    SND.play("click", 0.75)
+                elif globals().get("mobile_btn_hit") and mobile_btn_hit(mx, my):
+                    g["paused"] = not g["paused"]
+                    g["confirm_until"] = 0
+                    SND.play("click", 0.7)
+                elif not g["paused"] and mute_hit(mx, my):
+                    s["muted"] = SND.toggle()
+                    write_save(s)
+                elif g["paused"]:
                     pause_click(mx, my)
                 elif mx < GW:
-                    g["rings"].append([mx, my, 0.3])
+                    tap = TapFX(mx, my)
+                    g["taps"].append(tap)
+                    SND.play(random.choice(("tap1", "tap2", "tap3")), 0.5)
                     coin = next((c for c in g["coins"] if math.hypot(mx - c.x, my - c.y) < 38), None)
                     if coin:
+                        tap.color = (255, 226, 120)
+                        tap.power = 1.35
                         collect_coin(coin)          # монета ловится вместо толчка
                     else:
                         rad = push_radius()
+                        hit_direct = fell = False
+                        falls = 0
                         for p in g["people"]:
                             if p.state != "walk":
                                 continue
                             direct = p.rect().collidepoint(mx, my)
                             if direct or p.rect().inflate(rad * 2, rad * 2).collidepoint(mx, my):
-                                p.push(direct=direct)
+                                hit_direct = hit_direct or direct
+                                if p.push(direct=direct):
+                                    fell = True
+                                    falls += 1
+                        if hit_direct:
+                            tap.power = 1.45
+                            tap.color = (255, 224, 150)
+                        if fell:
+                            SND.play("hit", 0.42)
+                            P.on_push(s, falls)
                         bs = g["boss"]
                         if bs and bs.state == "fight" and bs.rect().inflate(rad, rad).collidepoint(mx, my):
-                            dmg = 1 + 2 * lv("smash")
-                            crit = random.random() < 0.05 * lv("crit")
+                            dmg = P.click_damage(s, bs)
+                            crit = random.random() < P.crit_chance(s)
                             if crit:
-                                dmg *= 3
-                            smash(bs, dmg, mx, my, crit)
+                                dmg = int(dmg * P.crit_mult(s))
+                            if smash(bs, dmg, mx, my, crit) == "ok":
+                                tap.power = 1.6
+                                tap.color = (255, 205, 120) if not crit else (255, 150, 90)
                 else:
-                    if TAB_Y <= my < TAB_Y + 26:
+                    if TAB_Y - 4 <= my < TAB_Y + 34:
                         g["tab"] = max(0, min(len(TAB_NAMES) - 1,
-                                              int((mx - (GW + 10)) // TAB_GAP)))
+                                              int((mx - (GW + 12)) // TAB_GAP)))
                     else:
                         k = int((my - ROW_Y0) // ROW_H)
                         if g["tab"] == ITEM_TAB:
@@ -3733,7 +2487,8 @@ def main():
                                 else:
                                     use_item(s, k, g)
                         elif 0 <= k < ROWS_PER_TAB:
-                            buy(s, g["tab"] * ROWS_PER_TAB + k, g)
+                            buy(s, g["tab"] * ROWS_PER_TAB + k, g,
+                                10 if pygame.key.get_mods() & pygame.KMOD_SHIFT else 1)
 
         if g.get("intro_pending"):
             # после полного сброса прогресса кролик и титры идут заново
@@ -3741,13 +2496,32 @@ def main():
             g["paused"] = False
             run_intro()
 
-        if g["paused"]:
-            dt = 0.0                  # пауза: время в игре стоит
-        # хардкор включается сразу после 10-го уровня: идут секундомер и жизни
-        hard = bool(s["won"])
+        if g["paused"] or g["depot"]:
+            dt = 0.0                  # пауза/Депо: время в игре стоит
+        # хардкор включается после 10-го уровня и остаётся в новых циклах:
+        # маршрут уже знаком, поэтому секундомер и жизни идут с 1-й станции
+        hard = bool(s["won"] or P.ensure(s).get("reborn", 0) > 0)
         if hard:
             g["hard_t"] += dt
+            P.on_hard_time(s, g["hard_t"])
         g["life_flash"] = max(0.0, g["life_flash"] - dt)
+
+        # оценка дохода для офлайна и HUD (раз в 2 секунды)
+        g["rate_t"] += dt
+        if g["rate_t"] >= 2.0:
+            rate = g["earn_acc"] / max(0.001, g["rate_t"])
+            P.set_income_rate(s, rate)
+            g["rate_show"] = rate
+            g["earn_acc"] = 0.0
+            g["rate_t"] = 0.0
+
+        # уведомления из мета-слоя (контракты, достижения, перерождение)
+        if g["toast_t"] <= 0:
+            msg = P.pop_notice(s)
+            if msg:
+                g["toast"] = msg
+                g["toast_col"] = (255, 224, 120)
+                g["toast_t"] = 2.8
 
         # «Час пик»: случайное событие — народу и денег вдвое больше
         if g["rush"] > 0:
@@ -3759,8 +2533,9 @@ def main():
         else:
             g["rush_t"] -= dt
             if g["rush_t"] <= 0:
-                g["rush"] = RUSH_DUR
-                g["rush_t"] = random.uniform(70, 110)
+                g["rush"] = RUSH_DUR * P.rush_scale(s)
+                g["rush_t"] = random.uniform(70, 110) / P.rush_scale(s)
+                SND.play("rush", 0.8)
                 g["toast"] = "ЧАС ПИК! Толпа и доход x2!"
                 g["toast_col"] = (255, 190, 90)
                 g["toast_t"] = 3.0
@@ -3780,7 +2555,7 @@ def main():
 
         # спавн: зелье потока удваивает поток, дальше по платформе — всё пёстрее
         g["spawn"] -= dt
-        flow = 1 + 0.25 * lv("flow")
+        flow = (1 + 0.25 * lv("flow")) * P.run_flow_mult(s)
         boosted = g["fx"]["p_flow"] > 0
         if boosted:
             flow *= 2
@@ -3789,9 +2564,11 @@ def main():
         # в хардкоре народу в разы больше: и поток чаще, и вместимость выше
         crowd = 4 if hard else 1
         max_people = min(90 if hard else 46,
-                         (14 + 2 * lv("cap")) * (2 if (boosted or g["rush"] > 0) else 1) * crowd)
+                         (14 + 2 * lv("cap") + P.capacity_bonus(s))
+                         * (2 if (boosted or g["rush"] > 0) else 1)
+                         * crowd * P.run_flow_mult(s))
         if g["spawn"] <= 0 and len(g["people"]) < max_people:
-            gold = random.random() < 0.04 + 0.03 * lv("gold")
+            gold = random.random() < 0.04 + 0.03 * lv("gold") + P.gold_chance_bonus(s)
             g["people"].append(Person(gold, pick_kind(s["kills"]), pick_skin(s)))
             g["spawn"] = random.uniform(1.2, 2.2) / (flow * (1 + min(0.5, s["kills"] / 4000.0))
                                                      * (2.5 if hard else 1))
@@ -3812,6 +2589,27 @@ def main():
                 walkers = [p for p in g["people"] if p.state == "walk" and 20 < p.x < GW - 20]
                 if walkers:
                     random.choice(walkers).push()
+                    P.on_push(s)
+
+        # автоматизация из Депо: автотолчок и автозакупка
+        ap = P.auto_push_interval(s)
+        if ap > 0:
+            g["autopush_t"] += dt
+            if g["autopush_t"] >= ap:
+                g["autopush_t"] = 0.0
+                walkers = [p for p in g["people"] if p.state == "walk" and 20 < p.x < GW - 20]
+                if walkers:
+                    random.choice(walkers).push()
+                    P.on_push(s)
+                    g["rings"].append([random.choice(walkers).x, PLAT_TOP + 20, 0.3])
+        ab = P.auto_buy_interval(s)
+        if ab > 0:
+            g["autobuy_t"] += dt
+            if g["autobuy_t"] >= ab:
+                g["autobuy_t"] = 0.0
+                idx = P.autobuy_pick(s)
+                if idx is not None:
+                    buy(s, idx, g)
 
         # поезд: зелье «Сжатое расписание» ускоряет подход поезда
         hurry = 2 if g["fx"]["p_train"] > 0 else 1
@@ -3836,8 +2634,10 @@ def main():
         if (g["boss"] is None and g["boss_cd"] <= 0 and not s["won"]
                 and s["kills"] >= boss_at(s["level"])):
             g["boss"] = Boss(s["level"])
-            g["boss"].time_left += 5 * lv("timebonus")
+            g["boss"].time_left += 5 * lv("timebonus") + P.boss_time_bonus(s)
             scale_boss(g["boss"])
+            SND.play("boss", 0.9)
+            SND.boss_music()
             g["toast"] = f"БОСС: {g['boss'].name}!"
             g["toast_col"] = (255, 110, 90)
             g["toast_t"] = 3.0
@@ -3850,9 +2650,10 @@ def main():
                 g["secret_t"] = random.uniform(80, 150)
                 if s["kills"] >= 8 and random.random() < 0.7:
                     sb = FlyingBoss(s["level"]) if random.random() < 0.35 else SecretBoss(s["level"])
-                    sb.time_left += 5 * lv("timebonus")
+                    sb.time_left += 5 * lv("timebonus") + P.boss_time_bonus(s)
                     scale_boss(sb)
                     g["boss"] = sb
+                    SND.play("boss", 0.8)
                     g["toast"] = f"СЕКРЕТНЫЙ БОСС: {sb.name}!"
                     g["toast_col"] = (255, 215, 70)
                     g["toast_t"] = 3.5
@@ -3889,9 +2690,12 @@ def main():
                 g["toast_t"] = 3.0
             elif (bs.state in ("fall", "track") and g["train"] and bs.y > 430
                   and g["train"].rect().inflate(0, 40).colliderect(bs.rect())):
-                reward = round(250 * (bs.level + 1) ** 2 * income_mult() * (4 if bs.secret else 1) * 1.5)
+                reward = round(250 * (bs.level + 1) ** 2 * income_mult() * (4 if bs.secret else 1) * 1.5
+                               * P.boss_loot_mult(s))
                 earn(reward)
+                P.on_boss(s, secret=bs.secret)
                 s["kills"] += 8 if bs.secret else 3
+                SND.play("levelup", 0.95)
                 g["shake"] = 0.7
                 g["effects"].append(Effect(bs.x, bs.y, ("СЕКРЕТНЫЙ БОСС ПОВЕРЖЕН! " if bs.secret else "БОСС ПОВЕРЖЕН! ")
                                            + f"+${fmt(reward)}", (255, 225, 60)))
@@ -3909,13 +2713,21 @@ def main():
                     g["toast"] = f"СЕКРЕТНЫЙ БОСС «{bs.name}» ПОВЕРЖЕН!"
                 elif s["level"] < len(THEMES) - 1:
                     s["level"] += 1
-                    g["toast"] = f"УРОВЕНЬ {s['level'] + 1}: {THEMES[s['level']]['name']}"
+                    P.on_station(s)
                     newly = [u["name"] for u in UPGRADES if u["req"] == s["level"]]
-                    if newly:
-                        g["toast"] += "  •  новое улучшение!"
+                    g["banner"] = f"СТАНЦИЯ {s['level'] + 1}"
+                    g["banner_sub"] = THEMES[s["level"]]["name"] + \
+                        ("  •  новое улучшение: " + ", ".join(newly) if newly else "")
+                    g["banner_t"] = g["banner_dur"] = 4.2
+                    SND.next_station_music()      # на каждой станции своя тема маршрута
+                    g["toast_t"] = 0.0
                 else:
                     s["won"] = True
-                    g["toast"] = "ПОБЕДА! ХАРДКОР: ушёл = -1 жизнь!"
+                    P.on_station(s)
+                    g["banner"] = "ФИНАЛ РЕЙСА!"
+                    g["banner_sub"] = "20 станций пройдено  •  Депо (P) → Перерождение  •  дальше ХАРДКОР"
+                    g["banner_t"] = g["banner_dur"] = 5.5
+                    g["toast_t"] = 0.0
                 g["toast_col"] = (255, 235, 120)
                 g["toast_t"] = 4.0
                 g["boss"] = None
@@ -3939,6 +2751,7 @@ def main():
                 if g["train"].rect().inflate(0, 40).colliderect(p.rect()):
                     g["combo"] += 1
                     g["combo_t"] = 6.0 + lv("combot")
+                    SND.play("train_hit", 0.62)
                     cap = 1.5 + 0.5 * lv("combo")
                     mult = min(1 + 0.1 * g["combo"], cap)
                     reward = round(10 * 1.35 ** lv("income") * mult * (5 if p.gold else 1)
@@ -3950,6 +2763,7 @@ def main():
                                                (255, 225, 60) if p.gold else (255, 255, 255)))
                     # серия: за каждую круглую отметку комбо — премия и конфетти
                     if g["combo"] in COMBO_MILESTONES:
+                        P.on_combo(s, g["combo"])
                         bonus = round(reward * g["combo"])
                         earn(bonus)
                         g["effects"].append(Effect(GW // 2, 330, f"СЕРИЯ x{g['combo']}! +${fmt(bonus)}",
@@ -3985,6 +2799,8 @@ def main():
             pt.update(dt)
         for rg in g["rings"]:
             rg[2] -= dt
+        for tf in g["taps"]:
+            tf.update(dt)
         for a in g["acids"]:
             a.update(dt)
             if a.done:
@@ -4014,9 +2830,10 @@ def main():
                        if p.state != "gone"
                        and not (p.state == "track" and p.timer <= 0)
                        and -60 < p.x < GW + 60]
-        g["effects"] = [ef for ef in g["effects"] if ef.t > 0]
-        g["particles"] = [pt for pt in g["particles"] if pt.life > 0][-600:]
+        g["effects"] = [ef for ef in g["effects"] if ef.t > 0][-90 if WEB else -140:]
+        g["particles"] = [pt for pt in g["particles"] if pt.life > 0][-280 if WEB else -420:]
         g["rings"] = [rg for rg in g["rings"] if rg[2] > 0]
+        g["taps"] = [tf for tf in g["taps"] if tf.t > 0]
 
         # смена локации
         new_stage = s["level"]
@@ -4029,19 +2846,26 @@ def main():
             if g["trans"] >= 1.0:
                 g["prev"] = g["stage"]
         g["toast_t"] = max(0.0, g["toast_t"] - dt)
+        g["banner_t"] = max(0.0, g["banner_t"] - dt)
         e_t = g["trans"] * g["trans"] * (3 - 2 * g["trans"])
         if g["trans"] < 1.0:
             e_t = round(e_t * 24) / 24      # 24 шага перехода: слои фона не пересобираются каждый кадр
         col = blend(THEMES[g["prev"]], THEMES[g["stage"]], e_t)
         cur = THEMES[g["stage"]] if g["trans"] > 0.4 else THEMES[g["prev"]]
         kind, name = cur["kind"], cur["name"]
+        sync_backdrop(cur)
         world.update(dt, kind)
+        # босс ушёл/повержен — возвращаемся к теме маршрута
+        if g["boss"] is None and SND.music_key == "boss":
+            SND.station_music()
+        SND.sync_pause(g["paused"] or g["depot"])
+        SND.tick()
 
         # автосохранение
         save_t -= dt
         if save_t <= 0:
             write_save(s)
-            save_t = 5.0
+            save_t = 12.0
 
         # ---------- отрисовка мира ----------
         canvas = win if SCALED_OK else canvas_buf
@@ -4061,6 +2885,7 @@ def main():
         if on:
             glow(wsurf, (GW - 55, 262), 70, (255, 60, 60), 160)
             D.circle(wsurf, (255, 170, 160), (GW - 58, 258), 4)
+        QUOTE_BOXES.clear()
         for p in g["people"]:
             p.draw(wsurf, warn=hard)
         for c in g["coins"]:
@@ -4075,6 +2900,8 @@ def main():
             pt.draw(wsurf)
         for ef in g["effects"]:
             ef.draw(wsurf)
+        for tf in g["taps"]:
+            tf.draw(wsurf)
         for rg in g["rings"]:
             k = 1 - rg[2] / 0.3
             D.circle(wsurf, (255, 255, 255), (int(rg[0]), int(rg[1])), int(8 + 26 * k), 2)
@@ -4084,6 +2911,7 @@ def main():
             glow(wsurf, mouse, rad, (255, 255, 255), 30)
             D.circle(wsurf, (255, 255, 255), (int(mouse[0]), int(mouse[1])), rad, 1)
         world.draw_front(wsurf, kind)
+        UI.draw_atmosphere(wsurf, col, kind, world.t, g["rush"] > 0)
         if g["rush"] > 0:                 # час пик: тёплая пульсация по краям
             pr = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() / 220.0)
             glow(wsurf, (GW // 2, PLAT_TOP + 20), 520, (255, 170, 60), int(30 + 20 * pr))
@@ -4092,98 +2920,94 @@ def main():
             canvas.fill((0, 0, 0))
             canvas.blit(wsurf, (px(random.randint(-amp, amp)), px(random.randint(-amp, amp))))
 
-        # ---------- HUD ----------
-        money_s = fmt(s["money"])
-        mw = int(twidth(f_money, money_s))
-        plate(canvas, (10, 6, max(210, 76 + mw), 76), 150, 14)
-        glow(canvas, (34, 32), 26, (255, 210, 60), 90)
-        D.circle(canvas, (255, 205, 40), (34, 32), 15)
-        D.circle(canvas, (200, 150, 20), (34, 32), 15, 3)
-        D.circle(canvas, (255, 235, 140), (29, 27), 4)
-        text(canvas, "$", f_mid, (160, 110, 10), (28, 21), shadow=False)
-        text(canvas, money_s, f_money, (255, 255, 255), (58, 12))
-        text(canvas, f"Всего поездок: {fmt(s['kills'])}", f_small, (225, 230, 245), (22, 56), shadow=False)
-        # хардкор: секундомер и жизни
-        if hard:
-            plate(canvas, (252, 6, 252, 76), 150, 14, border=(255, 96, 96, 110))
-            text(canvas, "ХАРДКОР", f_small, (255, 120, 110), (264, 12), shadow=False)
-            if g["lives"] <= 2 and int(pygame.time.get_ticks() / 250) % 2 == 0:
-                glow(canvas, (378, 46), 120, (255, 40, 40), 120)   # мало жизней — пульс
-            for i in range(HARD_LIVES):
-                draw_heart(canvas, 278 + i * 30, 42, 10, i < g["lives"])
-            tt = fmt_time(g["hard_t"])
-            text(canvas, tt, f_mid, (255, 255, 255), (490 - twidth(f_mid, tt), 36), shadow=False)
+        # ---------- HUD 3.0 ----------
+        UI.draw_hud(canvas, s, g, mouse, name, hard)
+        bs = g["boss"]
+
+        # ---- активные эффекты: компактные чипы слева под HUD ----
+        chips = []
         if g["combo"] > 1:
             cap = 1.5 + 0.5 * lv("combo")
-            glow(canvas, (105, 104), 95, (255, 120, 60), 60)   # огненное свечение комбо
             mult = min(1 + 0.1 * g["combo"], cap)
-            text(canvas, f"Комбо x{mult:.1f} ({g['combo']})", f_mid, (255, 130, 95), (20, 92))
-            bw = int(170 * max(0.0, min(1.0, g["combo_t"] / (6.0 + lv("combot")))))
-            D.rect(canvas, (20, 20, 30), (20, 118, 170, 6), border_radius=3)
-            D.rect(canvas, (255, 140, 90), (20, 118, bw, 6), border_radius=3)
-            nxt = next((m for m in COMBO_MILESTONES if m > g["combo"]), None)
-            if nxt:
-                text(canvas, f"до премии: {nxt - g['combo']}", f_small, (255, 205, 160), (20, 128),
-                     shadow=False)
-        if g["train"] and g["train"].gold:
-            text(canvas, "ЗОЛОТОЙ ПОЕЗД! x3", f_mid, (255, 215, 60), (20, 150))
-        # уровень и прогресс до босса
-        plate(canvas, (GW - 296, 6, 288, 84), 150, 14)
-        text(canvas, f"Уровень {s['level'] + 1}/{len(THEMES)}: {name}", f_mid, (255, 255, 255), (GW - 286, 12))
-        bs = g["boss"]
-        if s["won"]:
-            text(canvas, f"ХАРДКОР идёт — секундомер {fmt_time(g['hard_t'])}", f_small,
-                 (255, 235, 120), (GW - 286, 46))
-        elif bs:
-            text(canvas, "Босс на платформе!", f_small, (255, 120, 100), (GW - 286, 46))
-        else:
-            lo = THEMES[s["level"]]["kills"]
-            hi = boss_at(s["level"])
-            frac = max(0.0, min(1.0, (s["kills"] - lo) / max(1, hi - lo)))
-            D.rect(canvas, (20, 20, 30), (GW - 286, 42, 268, 10), border_radius=5)
-            if frac > 0:
-                fw = max(2, int(268 * frac))
-                D.rect(canvas, (230, 110, 90), (GW - 286, 42, fw, 10), border_radius=5)
-                D.rect(canvas, (255, 175, 150), (GW - 284, 43, max(1, fw - 4), 3), border_radius=2)
-            D.rect(canvas, (255, 255, 255), (GW - 286, 42, 268, 10), 1, border_radius=5)
-            left = hi - s["kills"]
-            text(canvas, "Босс идёт!" if left <= 0 else f"До босса: {left}", f_small,
-                 (255, 255, 255), (GW - 286, 62))
-        # активные зелья и события
-        ay = 98
+            chips.append((f"СЕРИЯ x{mult:.1f} ({g['combo']})",
+                          max(0.0, min(1.0, g["combo_t"] / (6.0 + lv("combot")))),
+                          f"{g['combo_t']:.0f}с", (255, 140, 86)))
         if g["rush"] > 0:
-            plate(canvas, (GW - 296, ay - 2, 288, 20), 140, 8, border=(255, 190, 90, 120))
-            text(canvas, "ЧАС ПИК x2", f_small, (255, 200, 110), (GW - 288, ay), shadow=False)
-            tw = max(0.0, min(1.0, g["rush"] / RUSH_DUR))
-            D.rect(canvas, (44, 32, 20), (GW - 200, ay + 5, 110, 7), border_radius=3)
-            D.rect(canvas, (255, 180, 80), (GW - 200, ay + 5, int(110 * tw), 7), border_radius=3)
-            text(canvas, f"{g['rush']:.0f}с", f_small, (255, 255, 255), (GW - 80, ay), shadow=False)
-            ay += 22
+            chips.append(("ЧАС ПИК x2",
+                          max(0.0, min(1.0, g["rush"] / (RUSH_DUR * P.rush_scale(s)))),
+                          f"{g['rush']:.0f}с", (255, 186, 80)))
         for k, label in FX_LABELS.items():
             if g["fx"][k] > 0:
-                plate(canvas, (GW - 296, ay - 2, 288, 20), 130, 8)
-                text(canvas, f"{label}", f_small, (150, 250, 165), (GW - 288, ay), shadow=False)
-                tw = max(0.0, min(1.0, g["fx"][k] / 45.0))
-                D.rect(canvas, (24, 40, 30), (GW - 200, ay + 5, 110, 7), border_radius=3)
-                D.rect(canvas, (110, 220, 140), (GW - 200, ay + 5, int(110 * tw), 7), border_radius=3)
-                text(canvas, f"{g['fx'][k]:.0f}с", f_small, (255, 255, 255), (GW - 80, ay), shadow=False)
-                ay += 22
+                chips.append((label, max(0.0, min(1.0, g["fx"][k] / 45.0)),
+                              f"{g['fx'][k]:.0f}с", (116, 226, 148)))
+        if g["train"] and g["train"].gold:
+            chips.append(("ЗОЛОТОЙ ПОЕЗД x3", 1.0, "", (255, 214, 70)))
+        if g["acid"] > 0:
+            chips.append(("КИСЛОТА", max(0.0, min(1.0, g["acid"] / 5.0)),
+                          f"{g['acid']:.0f}с", (160, 246, 100)))
+        cy = 98
+        for label, ratio, tm, col in chips[:5]:
+            w = int(twidth(f_small, label) + twidth(f_small, tm) + 32)
+            w = max(172, min(238, w))
+            plate(canvas, (12, cy, w, 25), 150, 8, border=(col[0], col[1], col[2], 120))
+            D.rect(canvas, col, (18, cy + 9, 4, 7), border_radius=2)
+            text(canvas, label, f_small, col, (27, cy + 2), shadow=False)
+            if tm:
+                text(canvas, tm, f_small, (235, 240, 250),
+                     (w + 1 - twidth(f_small, tm), cy + 2), shadow=False)
+            D.rect(canvas, (26, 28, 40), (27, cy + 19, w - 31, 3), border_radius=2)
+            D.rect(canvas, col, (27, cy + 19, int((w - 31) * ratio), 3), border_radius=2)
+            cy += 28
+
         if g["acid"] > 0:
             text(canvas, f"КИСЛОТА В ГЛАЗАХ: {g['acid']:.0f}с", f_mid, (165, 255, 95),
                  (GW // 2, H - 56), center=True)
         if bs:
             draw_boss_bar(canvas, bs)
-        plate(canvas, (10, H - 34, 700, 26), 120, 10)
-        text(canvas, "Клик — столкнуть  |  лови монеты $  |  Esc — пауза  |  F11 — экран  |  F10 — качество",
-             f_small, (235, 238, 250), (20, H - 30), shadow=False)
+        hint = "Клик — столкнуть  ·  монеты $  ·  P — Депо  ·  Esc — пауза  ·  F11 — экран"
+        plate(canvas, (10, H - 34, min(GW - 20, int(twidth(f_small, hint)) + 26), 26),
+              150, 10, border=(60, 68, 92, 110))
+        text(canvas, hint, f_small, (196, 206, 232), (20, H - 30), shadow=False)
+
+        # ---- баннер новой станции ----
+        if g["banner_t"] > 0:
+            bdur = g.get("banner_dur", 4.2)
+            age = max(0.0, bdur - g["banner_t"])
+            a = max(0.0, min(1.0, age / 0.25, g["banner_t"] / 0.55))
+            dy = int((1.0 - min(1.0, age / 0.35)) * 26)
+            fb = fit_font(g["banner"], GW - 150)
+            bw = max(360, int(twidth(fb, g["banner"])) + 92)
+            by = 178 + dy
+            plate(canvas, (GW // 2 - bw // 2, by, bw, 92), int(205 * a), 18,
+                  border=(255, 210, 120, int(150 * a)))
+            D.rect(canvas, (255, 206, 96), (GW // 2 - bw // 2 + 18, by + 10, bw - 36, 2),
+                   border_radius=1)
+            text(canvas, g["banner"], fb, (255, 244, 214), (GW // 2, by + (92 - fb.get_height() / K) / 2),
+                 center=True)
+            sub = g["banner_sub"]
+            if sub:
+                text(canvas, sub, fit_font(sub, GW - 120, (f_mid, f_small)), (255, 214, 150),
+                     (GW // 2, by + 66), center=True, shadow=False)
+        # ---- компактный тост сверху: не перекрывает сцену и не спорит с баннером ----
         if g["toast_t"] > 0:
-            tw = int(twidth(f_big, g["toast"]))
+            maxw = GW - 160
+            ft = fit_font(g["toast"], maxw, (f_mid, f_small))
+            msg = g["toast"]
+            if twidth(ft, msg) > maxw:
+                msg = ellipsize(ft, msg, maxw)
+            tw = int(twidth(ft, msg))
             ta = min(1.0, g["toast_t"] / 0.4)
-            plate(canvas, (GW // 2 - tw // 2 - 28, 138, tw + 56, 66), int(160 * ta), 18,
-                  border=(255, 255, 255, int(60 * ta)))
-            text(canvas, g["toast"], f_big, g["toast_col"], (GW // 2, 146), center=True)
+            pl = pygame.Rect(GW // 2 - tw // 2 - 24, 104, tw + 48, 38)
+            plate(canvas, pl, int(195 * ta), 12,
+                  border=(255, 255, 255, int(65 * ta)))
+            D.rect(canvas, g["toast_col"], (pl.x + 8, pl.y + 9, 4, pl.h - 18),
+                   border_radius=2)
+            th = ft.get_height() / K
+            text(canvas, msg, ft, g["toast_col"],
+                 (GW // 2, pl.y + (pl.h - th) / 2), center=True)
 
         draw_panel(canvas, s, mouse, g["tab"])
+        draw_mute_button(canvas, SND.muted, mute_hit(mouse[0], mouse[1]))
 
         # ---------- всё, что летит в камеру, поверх интерфейса ----------
         for a in g["acids"]:
@@ -4198,11 +3022,29 @@ def main():
             RED_FLASH.set_alpha(int(140 * min(1.0, g["life_flash"])))
             canvas.blit(RED_FLASH, (0, 0))
 
+        # ---------- Депо: постоянное наследие ----------
+        if g["depot"]:
+            UI.draw_depot(canvas, s, g, mouse)
+
         # ---------- меню паузы ----------
         if g["paused"]:
             canvas.blit(PAUSE_DIM, (0, 0))
-            plate(canvas, (W // 2 - 230, 110, 460, 400), 210, 22, border=(255, 255, 255, 70))
-            text(canvas, "ПАУЗА", f_big, (255, 255, 255), (W // 2, 128), center=True)
+            plate(canvas, (W // 2 - 270, 96, 540, 430), 218, 24,
+                  border=(150, 175, 230, 90))
+            D.rect(canvas, (66, 104, 190), (W // 2 - 246, 108, 492, 2), border_radius=1)
+            text(canvas, "ПАУЗА", f_big, (255, 255, 255), (W // 2, 116), center=True)
+            text(canvas, f"СТАНЦИЯ {s['level'] + 1} / {len(THEMES)}   •   {name}",
+                 f_mid, (152, 196, 255), (W // 2, 166), center=True, shadow=False)
+            # короткая сводка прогресса
+            stat_y = 192
+            D.rect(canvas, (26, 30, 46), (W // 2 - 220, stat_y, 440, 26), border_radius=9)
+            D.rect(canvas, (54, 62, 90), (W // 2 - 220, stat_y, 440, 26), 1, border_radius=9)
+            text(canvas, f"Баланс ${fmt(s['money'])}", f_small, (255, 224, 120),
+                 (W // 2 - 202, stat_y + 5), shadow=False)
+            text(canvas, f"Поездок {fmt(s['kills'])}", f_small, (214, 222, 244),
+                 (W // 2 - 34, stat_y + 5), shadow=False)
+            text(canvas, f"Станций {s['level'] + 1}/{len(THEMES)}", f_small,
+                 (214, 222, 244), (W // 2 + 128, stat_y + 5), shadow=False)
             armed = pygame.time.get_ticks() < g["confirm_until"]
             labels = [
                 "Продолжить  (Esc)",
@@ -4220,19 +3062,28 @@ def main():
                     edge = (140, 165, 230) if hot else (80, 90, 130)
                 if hot and i == 2 and not armed:
                     base = (100, 50, 58)
-                card(canvas, r, base, edge)
+                card(canvas, r, base, edge, edge)
+                # номер пункта слева и стрелка справа — без привязки к смыслу кнопки
+                D.circle(canvas, lerp_c(base, (255, 255, 255), 0.16),
+                         (r.x + 28, r.centery), 15)
+                D.circle(canvas, edge, (r.x + 28, r.centery), 15, 1)
+                text(canvas, str(i + 1), f_small, (240, 246, 255),
+                     (r.x + 21, r.centery - 8), shadow=False)
                 text(canvas, labels[i], f_mid, (255, 255, 255), (r.centerx, r.y + 15),
                      center=True, shadow=False)
+                D.line(canvas, edge, (r.right - 30, r.centery),
+                       (r.right - 22, r.centery), 2)
+                D.line(canvas, edge, (r.right - 26, r.centery - 4),
+                       (r.right - 22, r.centery), 2)
+                D.line(canvas, edge, (r.right - 26, r.centery + 4),
+                       (r.right - 22, r.centery), 2)
             text(canvas, f"Качество: x{K:g} (F10)   •   прогресс сохраняется автоматически",
                  f_small, (170, 176, 205), (W // 2, 490), center=True, shadow=False)
 
         # ---------- вывод на экран с масштабированием ----------
         if not SCALED_OK:
             win.fill((0, 0, 0))
-            if (dw, dh) == (WP, HP):
-                win.blit(canvas_buf, (ox, oy))
-            else:
-                win.blit(pygame.transform.smoothscale(canvas_buf, (dw, dh)), (ox, oy))
+            present(canvas_buf, win, ox, oy, dw, dh)
         pygame.display.flip()
 
 
